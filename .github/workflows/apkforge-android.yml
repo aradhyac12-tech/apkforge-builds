@@ -1,0 +1,74 @@
+name: APKForge Android
+on:
+  workflow_dispatch:
+    inputs:
+      build_id: { description: APKForge build id, required: true }
+      source_url: { description: Signed URL to source zip, required: true }
+      project_kind: { description: capacitor-full | capacitor-partial | web-app, required: true }
+      app_name: { description: App display name, required: false, default: "App" }
+      bundle_id: { description: Reverse-DNS bundle id, required: true }
+      web_dir: { description: Web build output directory, required: false, default: "www" }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Fetch source
+        run: |
+          curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
+          mkdir project
+          unzip -q source.zip -d project
+      - name: Install & inject Capacitor (Android)
+        working-directory: project
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name }}
+          BUNDLE_ID: ${{ github.event.inputs.bundle_id }}
+          WEB_DIR: ${{ github.event.inputs.web_dir }}
+          PROJECT_KIND: ${{ github.event.inputs.project_kind }}
+        run: |
+          set -e
+          if [ ! -f package.json ]; then
+            echo '{"name":"apkforge-app","version":"1.0.0","private":true}' > package.json
+          fi
+          npm install --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps
+          if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
+            npm i @capacitor/core @capacitor/cli
+            mkdir -p "$WEB_DIR"
+            [ -f "$WEB_DIR/index.html" ] || echo "<!doctype html><html><body><h1>$APP_NAME</h1></body></html>" > "$WEB_DIR/index.html"
+            npx cap init "$APP_NAME" "$BUNDLE_ID" --web-dir="$WEB_DIR"
+          fi
+          npm i @capacitor/android || true
+          if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
+            npm run build || echo "build script failed — continuing with existing web assets"
+          fi
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+          npx cap sync android || true
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.APKFORGE_KEYSTORE_B64 }}" | base64 -d > project/android/app/release.keystore
+      - name: Gradle build
+        working-directory: project/android
+        env:
+          GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease \
+            -Pandroid.injected.signing.store.file=${{ github.workspace }}/project/android/app/release.keystore \
+            -Pandroid.injected.signing.store.password="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.APKFORGE_KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.APKFORGE_KEY_PASSWORD }}"
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.build_id }}
+          path: project/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
