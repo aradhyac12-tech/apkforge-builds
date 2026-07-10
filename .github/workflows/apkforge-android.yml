@@ -19,7 +19,7 @@ jobs:
         with: { node-version: '22' }
       - name: Setup Java
         uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '17' }
+        with: { distribution: temurin, java-version: '21' }
       - name: Fetch source
         run: |
           curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
