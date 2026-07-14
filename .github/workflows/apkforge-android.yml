@@ -8,6 +8,7 @@ on:
       app_name: { description: App display name, required: false, default: "App" }
       bundle_id: { description: Reverse-DNS bundle id, required: true }
       web_dir: { description: Web build output directory, required: false, default: "www" }
+      variant: { description: "Output variant: apk | aab", required: false, default: "apk" }
 
 jobs:
   build:
@@ -16,7 +17,7 @@ jobs:
     steps:
       - name: Setup Node
         uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with: { node-version: '20' }
       - name: Setup Java
         uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
@@ -59,16 +60,30 @@ jobs:
         working-directory: project/android
         env:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
+          VARIANT: ${{ github.event.inputs.variant }}
         run: |
           chmod +x ./gradlew
-          ./gradlew --no-daemon assembleRelease \
+          if [ "$VARIANT" = "aab" ]; then
+            TASK=bundleRelease
+          else
+            TASK=assembleRelease
+          fi
+          ./gradlew --no-daemon "$TASK" \
             -Pandroid.injected.signing.store.file=${{ github.workspace }}/project/android/app/release.keystore \
             -Pandroid.injected.signing.store.password="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}" \
             -Pandroid.injected.signing.key.alias="${{ secrets.APKFORGE_KEY_ALIAS }}" \
             -Pandroid.injected.signing.key.password="${{ secrets.APKFORGE_KEY_PASSWORD }}"
       - name: Upload APK
+        if: ${{ github.event.inputs.variant != 'aab' }}
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.build_id }}
           path: project/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+      - name: Upload AAB
+        if: ${{ github.event.inputs.variant == 'aab' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-${{ github.event.inputs.build_id }}
+          path: project/android/app/build/outputs/bundle/release/*.aab
           if-no-files-found: error
