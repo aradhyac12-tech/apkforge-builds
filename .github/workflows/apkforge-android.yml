@@ -8,9 +8,6 @@ on:
       app_name: { description: App display name, required: false, default: "App" }
       bundle_id: { description: Reverse-DNS bundle id, required: true }
       web_dir: { description: Web build output directory, required: false, default: "www" }
-      variant: { description: "Output variant: apk | aab", required: false, default: "apk" }
-      icon_url: { description: "Optional signed URL to app icon (PNG/JPG)", required: false, default: "" }
-
 
 jobs:
   build:
@@ -48,75 +45,12 @@ jobs:
             npx cap init "$APP_NAME" "$BUNDLE_ID" --web-dir="$WEB_DIR"
           fi
           npm i @capacitor/android || true
-          mkdir -p scripts
-          cat > scripts/apkforge-patch-capacitor.mjs <<'EOF'
-          import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-          const appName = process.env.APP_NAME || 'App';
-          const bundleId = process.env.BUNDLE_ID || 'com.apkforge.app';
-          const mode = process.argv[2] || 'all';
-          const escXml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-          const write = (p, v) => writeFileSync(p, v);
-          if ((mode === 'all' || mode === 'android') && existsSync('android/app/src/main/AndroidManifest.xml')) {
-            const p = 'android/app/src/main/AndroidManifest.xml';
-            let s = readFileSync(p, 'utf8');
-            s = s.replace(/<application\b([^>]*)>/, (m, attrs) => {
-              const next = /android:label=/.test(attrs)
-                ? attrs.replace(/android:label="[^"]*"/, 'android:label="' + escXml(appName) + '"')
-                : attrs + ' android:label="' + escXml(appName) + '"';
-              return '<application' + next + '>';
-            });
-            if (!/android.permission.INTERNET/.test(s)) {
-              s = s.replace(/<application\b/, '<uses-permission android:name="android.permission.INTERNET" />\n    <application');
-            }
-            write(p, s);
-            for (const gradle of ['android/app/build.gradle', 'android/app/build.gradle.kts']) {
-              if (!existsSync(gradle)) continue;
-              let g = readFileSync(gradle, 'utf8');
-              g = g
-                .replace(/applicationId\s+"[^"]+"/g, 'applicationId "' + bundleId + '"')
-                .replace(/applicationId\s*=\s*"[^"]+"/g, 'applicationId = "' + bundleId + '"')
-                .replace(/namespace\s+"[^"]+"/g, 'namespace "' + bundleId + '"')
-                .replace(/namespace\s*=\s*"[^"]+"/g, 'namespace = "' + bundleId + '"');
-              write(gradle, g);
-            }
-          }
-          EOF
-          node - <<'EOF'
-          const fs = require('fs');
-          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          pkg.scripts ||= {};
-          pkg.scripts['cap:add:ios'] ||= 'npm install --no-audit --no-fund @capacitor/ios && npx cap add ios && node scripts/apkforge-patch-capacitor.mjs ios';
-          pkg.scripts['cap:add:android'] ||= 'npm install --no-audit --no-fund @capacitor/android && npx cap add android && node scripts/apkforge-patch-capacitor.mjs android';
-          pkg.scripts['cap:sync'] ||= 'npx cap sync && node scripts/apkforge-patch-capacitor.mjs all';
-          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '
-');
-          EOF
           if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
             npm run build || echo "build script failed — continuing with existing web assets"
           fi
           if [ ! -d android ]; then
-            npm run cap:add:android
-          else
-            npx cap sync android || true
-            node scripts/apkforge-patch-capacitor.mjs android
+            npx cap add android
           fi
-      - name: Generate app icons
-        if: ${{ github.event.inputs.icon_url != '' }}
-        working-directory: project
-        env:
-          ICON_URL: ${{ github.event.inputs.icon_url }}
-        run: |
-          set -e
-          mkdir -p resources
-          curl -sSL --fail -o resources/icon-source "$ICON_URL"
-          # Detect extension by magic bytes (PNG vs JPG).
-          if head -c 8 resources/icon-source | grep -q PNG; then
-            mv resources/icon-source resources/icon.png
-          else
-            mv resources/icon-source resources/icon.jpg
-          fi
-          npm i -D @capacitor/assets || true
-          npx @capacitor/assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#000000' || echo "icon generation skipped"
           npx cap sync android || true
       - name: Decode keystore
         run: |
@@ -125,30 +59,16 @@ jobs:
         working-directory: project/android
         env:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
-          VARIANT: ${{ github.event.inputs.variant }}
         run: |
           chmod +x ./gradlew
-          if [ "$VARIANT" = "aab" ]; then
-            TASK=bundleRelease
-          else
-            TASK=assembleRelease
-          fi
-          ./gradlew --no-daemon "$TASK" \
+          ./gradlew --no-daemon assembleRelease \
             -Pandroid.injected.signing.store.file=${{ github.workspace }}/project/android/app/release.keystore \
             -Pandroid.injected.signing.store.password="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}" \
             -Pandroid.injected.signing.key.alias="${{ secrets.APKFORGE_KEY_ALIAS }}" \
             -Pandroid.injected.signing.key.password="${{ secrets.APKFORGE_KEY_PASSWORD }}"
       - name: Upload APK
-        if: ${{ github.event.inputs.variant != 'aab' }}
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.build_id }}
           path: project/android/app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
-      - name: Upload AAB
-        if: ${{ github.event.inputs.variant == 'aab' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: aab-${{ github.event.inputs.build_id }}
-          path: project/android/app/build/outputs/bundle/release/*.aab
           if-no-files-found: error
