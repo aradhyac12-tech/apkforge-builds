@@ -10,6 +10,7 @@ on:
       bundle_id: { description: Reverse-DNS bundle id, required: true }
       web_dir: { description: Web build output directory, required: false, default: "www" }
       logo_url: { description: Optional signed URL to a square app icon (PNG), required: false, default: "" }
+      node_version: { description: Node.js major version (20-24), required: false, default: "22" }
 
 jobs:
   build:
@@ -18,7 +19,7 @@ jobs:
     steps:
       - name: Setup Node
         uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with: { node-version: "${{ github.event.inputs.node_version }}" }
       - name: Setup Java
         uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '21' }
