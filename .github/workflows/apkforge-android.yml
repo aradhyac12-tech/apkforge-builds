@@ -15,7 +15,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
+    env:
+      APP_NAME: ${{ github.event.inputs.app_name }}
+      BUNDLE_ID: ${{ github.event.inputs.bundle_id }}
+      WEB_DIR: ${{ github.event.inputs.web_dir }}
+      PROJECT_KIND: ${{ github.event.inputs.project_kind }}
+      REPORT: ${{ github.workspace }}/project/android-prebuild-report.txt
     steps:
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -25,116 +31,401 @@ jobs:
         with: { distribution: temurin, java-version: '21' }
       - name: Fetch source
         run: |
+          set -e
           curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
-          mkdir project
+          mkdir -p project
           unzip -q source.zip -d project
-      - name: Install & validate Capacitor Android project
+          # If the zip wrapped everything in a single folder, flatten it.
+          cd project
+          if [ ! -f package.json ] && [ "$(ls -1 | wc -l)" = "1" ] && [ -d "$(ls -1)" ]; then
+            inner="$(ls -1)"
+            shopt -s dotglob
+            mv "$inner"/* . && rmdir "$inner"
+          fi
+          ls -la | head -n 40
+
+      - name: Environment diagnostics
         working-directory: project
-        env:
-          APP_NAME: ${{ github.event.inputs.app_name }}
-          BUNDLE_ID: ${{ github.event.inputs.bundle_id }}
-          WEB_DIR: ${{ github.event.inputs.web_dir }}
-          PROJECT_KIND: ${{ github.event.inputs.project_kind }}
         run: |
           set -e
-          echo "========== APKForge Android pre-build diagnostics =========="
-          echo "Node: $(node --version)"
-          echo "npm: $(npm --version)"
-          echo "Java: $(java -version 2>&1 | head -n 1)"
-          echo "ANDROID_HOME: ${ANDROID_HOME:-not set}"
-          if command -v sdkmanager >/dev/null 2>&1; then sdkmanager --version || true; fi
+          mkdir -p "$(dirname "$REPORT")"
+          : > "$REPORT"
+          log() { echo "$1" | tee -a "$REPORT"; }
+          log "========== APKForge Android pre-build report =========="
+          log "[env] Node: $(node --version)"
+          log "[env] npm: $(npm --version)"
+          log "[env] Java: $(java -version 2>&1 | head -n 1)"
+          log "[env] ANDROID_HOME: ${ANDROID_HOME:-not set}"
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34" >/dev/null 2>&1 || true
+            log "[env] Android SDK: licences accepted, platform-tools/build-tools ensured"
+          else
+            log "[env] Android SDK: sdkmanager not found (using preinstalled image SDK)"
+          fi
+
+      - name: Detect project and install dependencies
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
 
           if [ ! -f package.json ]; then
+            log "[detect] No package.json found — creating a minimal one (web-app mode)"
             echo '{"name":"apkforge-app","version":"1.0.0","private":true}' > package.json
           fi
 
-          PM="npm"
-          INSTALL_CMD="npm install --no-audit --no-fund"
-          RUN_CMD="npm run"
-          EXEC_CMD="npx"
+          PM="npm"; INSTALL_CMD="npm install --no-audit --no-fund"; RUN_CMD="npm run"; EXEC_CMD="npx"
           if [ -f bun.lockb ] || [ -f bun.lock ]; then
             PM="bun"
-            if ! command -v bun >/dev/null 2>&1; then npm install -g bun; fi
-            INSTALL_CMD="bun install"
-            RUN_CMD="bun run"
-            EXEC_CMD="bunx"
+            command -v bun >/dev/null 2>&1 || npm install -g bun
+            INSTALL_CMD="bun install"; RUN_CMD="bun run"; EXEC_CMD="bunx"
           elif [ -f pnpm-lock.yaml ]; then
-            PM="pnpm"
-            corepack enable
-            corepack prepare pnpm@latest --activate
-            INSTALL_CMD="pnpm install --no-frozen-lockfile"
-            RUN_CMD="pnpm run"
-            EXEC_CMD="pnpm exec"
+            PM="pnpm"; corepack enable; corepack prepare pnpm@latest --activate
+            INSTALL_CMD="pnpm install --no-frozen-lockfile"; RUN_CMD="pnpm run"; EXEC_CMD="pnpm exec"
+          elif [ -f yarn.lock ]; then
+            PM="yarn"; corepack enable; corepack prepare yarn@stable --activate
+            INSTALL_CMD="yarn install"; RUN_CMD="yarn"; EXEC_CMD="yarn"
           fi
-          echo "Package manager: $PM"
-          $INSTALL_CMD || { echo "Primary dependency install failed; retrying with npm legacy peer deps"; npm install --no-audit --no-fund --legacy-peer-deps; }
+          log "[detect] Package manager: $PM"
+          {
+            echo "PM=$PM"
+            echo "RUN_CMD=$RUN_CMD"
+            echo "EXEC_CMD=$EXEC_CMD"
+          } >> "$GITHUB_ENV"
+
+          if $INSTALL_CMD; then
+            log "[install] Dependencies installed with $PM"
+          else
+            log "[install] $PM install failed — retrying with npm --legacy-peer-deps (auto-repair)"
+            npm install --no-audit --no-fund --legacy-peer-deps || fail "Dependency install failed for this project. Check the log above for the failing package."
+            log "[install] Recovered with npm --legacy-peer-deps"
+          fi
+
+          # Align Capacitor packages so core/cli/android share a major version.
+          node -e "
+            const fs=require('fs');
+            const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+            const d={...(p.dependencies||{}),...(p.devDependencies||{})};
+            const maj=(v)=>{const m=String(v||'').match(/(\d+)/);return m?m[1]:null;};
+            const majors=['@capacitor/core','@capacitor/cli','@capacitor/android'].map(k=>d[k]?maj(d[k]):null).filter(Boolean);
+            const uniq=[...new Set(majors)];
+            console.log('CAP_MAJORS='+(uniq.join(',')||'none'));
+          " | tee -a "$REPORT"
 
           if node -e "require.resolve('@capacitor/cli')" 2>/dev/null; then
-            CAP="$EXEC_CMD cap"
+            log "[capacitor] CLI present"
           else
-            npm i @capacitor/core @capacitor/cli
-            CAP="npx cap"
+            log "[capacitor] CLI missing — installing @capacitor/core @capacitor/cli (auto-repair)"
+            npm i @capacitor/core @capacitor/cli || fail "Could not install the Capacitor CLI."
           fi
-          echo "Capacitor: $($CAP --version 2>/dev/null || echo unknown)"
+          npm i @capacitor/android >/dev/null 2>&1 || npm i @capacitor/android || fail "Could not install @capacitor/android."
+          log "[capacitor] Version: $(npx cap --version 2>/dev/null || echo unknown)"
+
+      - name: Build web assets
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
+            if $RUN_CMD build; then
+              log "[web] Build script completed"
+            else
+              log "[web] WARNING: build script failed — continuing with existing web assets"
+            fi
+          else
+            log "[web] No build script — using shipped web assets"
+          fi
+          # Resolve the real web output dir.
+          RESOLVED="$WEB_DIR"
+          if [ ! -f "$RESOLVED/index.html" ]; then
+            for c in dist build out www public dist/spa .output/public; do
+              if [ -f "$c/index.html" ]; then RESOLVED="$c"; break; fi
+            done
+          fi
+          if [ ! -f "$RESOLVED/index.html" ]; then
+            mkdir -p "$RESOLVED"
+            echo "<!doctype html><html><body><h1>$APP_NAME</h1></body></html>" > "$RESOLVED/index.html"
+            log "[web] No web output found — generated a placeholder index.html in $RESOLVED (auto-repair)"
+          fi
+          log "[web] Web directory: $RESOLVED"
+          echo "RESOLVED_WEB_DIR=$RESOLVED" >> "$GITHUB_ENV"
+
+      - name: Generate or repair native Android project
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          CAP="npx cap"
 
           if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
-            mkdir -p "$WEB_DIR"
-            [ -f "$WEB_DIR/index.html" ] || echo "<!doctype html><html><body><h1>$APP_NAME</h1></body></html>" > "$WEB_DIR/index.html"
-            $CAP init "$APP_NAME" "$BUNDLE_ID" --web-dir="$WEB_DIR"
+            log "[native] No capacitor config — running cap init (auto-repair)"
+            $CAP init "$APP_NAME" "$BUNDLE_ID" --web-dir="$RESOLVED_WEB_DIR" || fail "capacitor init failed for bundle id $BUNDLE_ID."
           fi
-          npm i @capacitor/android || true
-          if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
-            $RUN_CMD build || echo "build script failed — continuing with existing web assets"
+
+          if [ -d android ] && { [ ! -f android/gradlew ] || [ ! -f android/app/src/main/AndroidManifest.xml ] || [ ! -f android/capacitor.settings.gradle ]; }; then
+            log "[native] Existing android/ project is incomplete — regenerating (auto-repair)"
+            rm -rf android
           fi
           if [ ! -d android ]; then
-            $CAP add android
+            log "[native] Adding Android platform (cap add android)"
+            $CAP add android || fail "cap add android failed — the project could not be converted to a native Android project."
           fi
-          $CAP sync android
 
-          if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
-            echo "::error::Missing capacitor.config after initialization."
-            exit 1
-          fi
-          if [ ! -f android/app/src/main/AndroidManifest.xml ]; then
-            echo "::error::AndroidManifest.xml was not generated."
-            exit 1
-          fi
-          if [ ! -f android/gradlew ]; then
-            echo "::error::Gradle wrapper is missing from android project."
-            exit 1
-          fi
-          chmod +x android/gradlew
-          echo "Gradle:"
-          (cd android && ./gradlew --version | sed -n '1,8p')
-          echo "Android package config:"
-          grep -R "namespace |applicationId " -n android/app/build.gradle* 2>/dev/null | head -n 5 || true
-          echo "Capacitor plugins: $(node -e "const p=require('./package.json'); console.log(Object.keys({...p.dependencies,...p.devDependencies}).filter(x=>x.includes('capacitor')).join(', ') || 'none')")"
-          echo "========== APKForge Android pre-build diagnostics complete =========="
-      - name: Resolve app icon
+      - name: Sync icons and Capacitor plugins
         working-directory: project
         env:
           LOGO_URL: ${{ github.event.inputs.logo_url }}
         run: |
           set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          CAP="npx cap"
+
           mkdir -p resources
           if [ -n "$LOGO_URL" ]; then
-            echo "Using uploaded logo"
-            curl -sSL --fail -o resources/icon.png "$LOGO_URL"
+            curl -sSL --fail -o resources/icon.png "$LOGO_URL" && log "[icon] Using uploaded app icon"
           elif [ ! -f resources/icon.png ]; then
-            for candidate in public/icon.png public/logo.png public/apple-touch-icon.png src/assets/icon.png src/assets/logo.png assets/icon.png assets/logo.png icon.png logo.png; do
-              if [ -f "$candidate" ]; then
-                echo "Auto-detected icon at $candidate"
-                cp "$candidate" resources/icon.png
-                break
-              fi
+            for candidate in public/icon.png public/logo.png public/apple-touch-icon.png public/favicon.png src/assets/icon.png src/assets/logo.png assets/icon.png assets/logo.png icon.png logo.png; do
+              if [ -f "$candidate" ]; then cp "$candidate" resources/icon.png; log "[icon] Auto-detected icon at $candidate"; break; fi
             done
           fi
           if [ -f resources/icon.png ]; then
-            npm i -D @capacitor/assets || true
-            npx @capacitor/assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#000000' || echo "asset generation failed — continuing with default icon"
+            npm i -D @capacitor/assets >/dev/null 2>&1 || true
+            npx @capacitor/assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#000000' \
+              && log "[icon] Native icon/splash resources generated" \
+              || log "[icon] WARNING: asset generation failed — keeping default Capacitor icon"
           else
-            echo "No icon supplied or detected — using Capacitor default"
+            log "[icon] No icon supplied or detected — using Capacitor default"
           fi
+
+          $CAP sync android || { log "[sync] First cap sync failed — retrying after npm install (auto-repair)"; npm install --no-audit --no-fund --legacy-peer-deps; $CAP sync android || fail "cap sync android failed. Native plugins could not be synchronized."; }
+          log "[sync] cap sync android completed"
+
+          # Verify every installed Capacitor plugin got registered in the native project.
+          MISSING="$(node -e "
+            const fs=require('fs');
+            const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+            const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
+            const plugins=deps.filter(d=>/^@capacitor\//.test(d)&&!['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'].includes(d));
+            let reg='';
+            for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle']) { try { reg+=fs.readFileSync(f,'utf8'); } catch {} }
+            const missing=plugins.filter(pl=>!reg.includes(pl.replace('@capacitor/','capacitor-')) && !reg.includes(pl));
+            console.log(missing.join(','));
+          ")"
+          if [ -n "$MISSING" ]; then
+            log "[sync] Plugins not registered after first sync: $MISSING — re-syncing (auto-repair)"
+            $CAP sync android || fail "Plugin registration failed for: $MISSING"
+          fi
+          log "[sync] Registered Capacitor plugins: $(node -e "const p=require('./package.json');console.log(Object.keys({...p.dependencies,...p.devDependencies}).filter(x=>x.includes('capacitor')).join(', ')||'none')")"
+
+      - name: Validate and repair native configuration
+        working-directory: project
+        run: |
+          set -e
+          cat > /tmp/apkforge-native-check.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const report = process.env.REPORT;
+          const bundleId = process.env.BUNDLE_ID;
+          const problems = [];
+          const fixes = [];
+          const notes = [];
+          const log = (m) => { console.log(m); fs.appendFileSync(report, m + '\n'); };
+
+          const readSafe = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
+          const pkg = JSON.parse(readSafe('package.json') || '{}');
+          const deps = Object.keys({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) });
+
+          // ---- Gradle applicationId / namespace ----
+          const appGradlePath = 'android/app/build.gradle';
+          let appGradle = readSafe(appGradlePath);
+          if (!appGradle) problems.push('android/app/build.gradle is missing — the native project is incomplete.');
+          else {
+            let changed = false;
+            const before = appGradle;
+            appGradle = appGradle.replace(/applicationId\s+["'][^"']+["']/, 'applicationId "' + bundleId + '"');
+            appGradle = appGradle.replace(/namespace\s+["'][^"']+["']/, 'namespace "' + bundleId + '"');
+            if (appGradle !== before) changed = true;
+            if (/google-services\.json/.test('') === false && deps.some((d) => /firebase|@capacitor-firebase|@react-native-firebase/.test(d))) {
+              const gs = ['android/app/google-services.json', 'google-services.json', 'android/google-services.json']
+                .find((p) => fs.existsSync(p));
+              if (!gs) {
+                problems.push('Firebase dependencies detected but google-services.json is missing. Add it to android/app/ (or the project root) in the uploaded zip.');
+              } else {
+                if (gs !== 'android/app/google-services.json') {
+                  fs.copyFileSync(gs, 'android/app/google-services.json');
+                  fixes.push('Copied ' + gs + ' to android/app/google-services.json');
+                }
+                if (!/com\.google\.gms\.google-services/.test(appGradle)) {
+                  appGradle += '\napply plugin: "com.google.gms.google-services"\n';
+                  changed = true;
+                  fixes.push('Applied the google-services Gradle plugin');
+                }
+                const rootGradle = readSafe('android/build.gradle');
+                if (rootGradle && !/com\.google\.gms:google-services/.test(rootGradle)) {
+                  const patched = rootGradle.replace(/(dependencies\s*\{)/, '$1\n        classpath "com.google.gms:google-services:4.4.2"');
+                  if (patched !== rootGradle) {
+                    fs.writeFileSync('android/build.gradle', patched);
+                    fixes.push('Added the google-services classpath to android/build.gradle');
+                  }
+                }
+              }
+            }
+            // minSdk floor required by common plugins
+            const needs24 = deps.some((d) => /push-notifications|local-notifications|barcode|biometric|camera|filesystem|background/.test(d));
+            const minMatch = appGradle.match(/minSdkVersion\s+([A-Za-z0-9_.]+)/);
+            if (needs24 && minMatch && /^\d+$/.test(minMatch[1]) && Number(minMatch[1]) < 23) {
+              appGradle = appGradle.replace(/minSdkVersion\s+\d+/, 'minSdkVersion 23');
+              changed = true;
+              fixes.push('Raised minSdkVersion to 23 for the installed plugins');
+            }
+            if (changed) fs.writeFileSync(appGradlePath, appGradle);
+            log('[gradle] applicationId/namespace set to ' + bundleId);
+          }
+
+          // ---- Deep link schemes ----
+          const configRaw =
+            readSafe('capacitor.config.ts') || readSafe('capacitor.config.js') || readSafe('capacitor.config.json') || '';
+          const schemes = new Set();
+          const hosts = new Set();
+          if (bundleId) {
+            schemes.add(bundleId.toLowerCase());
+            const last = bundleId.split('.').pop();
+            if (last) schemes.add(last.toLowerCase());
+          }
+          const schemeKeys = [/customUrlScheme["']?\s*[:=]\s*["']([^"']+)["']/g, /urlScheme["']?\s*[:=]\s*["']([^"']+)["']/g, /androidScheme["']?\s*[:=]\s*["']([^"']+)["']/g];
+          for (const re of schemeKeys) {
+            let m;
+            while ((m = re.exec(configRaw))) {
+              const v = m[1].toLowerCase();
+              if (v !== 'https' && v !== 'http') schemes.add(v);
+            }
+          }
+          const hostMatch = /hostname["']?\s*[:=]\s*["']([^"']+)["']/.exec(configRaw);
+          if (hostMatch && !/^localhost$/i.test(hostMatch[1])) hosts.add(hostMatch[1]);
+
+          // Scan app sources for redirect URLs like "myapp://auth/callback".
+          const scanDirs = ['src', 'app', 'lib', 'pages'];
+          const scanFile = (p) => {
+            const t = readSafe(p);
+            if (!t) return;
+            const re = /([a-z][a-z0-9+.-]{2,}):\/\/([a-z0-9._~-]*)/gi;
+            let m;
+            while ((m = re.exec(t))) {
+              const s = m[1].toLowerCase();
+              if (['http', 'https', 'file', 'data', 'blob', 'ws', 'wss', 'mailto', 'tel', 'capacitor', 'ionic'].includes(s)) continue;
+              schemes.add(s);
+            }
+          };
+          const walk = (dir, depth) => {
+            if (depth > 4) return;
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+            for (const e of entries) {
+              const full = path.join(dir, e.name);
+              if (e.isDirectory()) { if (e.name !== 'node_modules') walk(full, depth + 1); }
+              else if (/\.(ts|tsx|js|jsx|vue|svelte|json|env|html)$/i.test(e.name)) scanFile(full);
+            }
+          };
+          for (const d of scanDirs) walk(d, 0);
+          for (const f of ['.env', '.env.production', '.env.local']) scanFile(f);
+
+          // ---- AndroidManifest: permissions + intent filters ----
+          const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+          let manifest = readSafe(manifestPath);
+          if (!manifest) problems.push('AndroidManifest.xml is missing from the generated native project.');
+          else {
+            const permsFor = [
+              [/camera|barcode|qr/, ['android.permission.CAMERA']],
+              [/microphone|voice-recorder|record/, ['android.permission.RECORD_AUDIO']],
+              [/filesystem|file-picker|file_picker|share|storage/, ['android.permission.READ_EXTERNAL_STORAGE']],
+              [/push-notifications|local-notifications|firebase-messaging/, ['android.permission.POST_NOTIFICATIONS', 'android.permission.VIBRATE']],
+              [/biometric|native-biometric/, ['android.permission.USE_BIOMETRIC']],
+              [/background|geolocation/, ['android.permission.ACCESS_NETWORK_STATE']],
+            ];
+            const needed = new Set(['android.permission.INTERNET']);
+            for (const [re, perms] of permsFor) {
+              if (deps.some((d) => re.test(d))) perms.forEach((p) => needed.add(p));
+            }
+            const missingPerms = [...needed].filter((p) => !manifest.includes('"' + p + '"'));
+            if (missingPerms.length) {
+              const block = missingPerms.map((p) => '    <uses-permission android:name="' + p + '" />').join('\n');
+              manifest = manifest.replace(/<\/manifest>/, block + '\n</manifest>');
+              fixes.push('Added permissions: ' + missingPerms.join(', '));
+            }
+
+            const missingSchemes = [...schemes].filter((s) => !new RegExp('android:scheme="' + s + '"').test(manifest));
+            if (missingSchemes.length) {
+              const filters = missingSchemes
+                .map(
+                  (s) =>
+                    [
+                      '            <intent-filter android:autoVerify="false">',
+                      '                <action android:name="android.intent.action.VIEW" />',
+                      '                <category android:name="android.intent.category.DEFAULT" />',
+                      '                <category android:name="android.intent.category.BROWSABLE" />',
+                      '                <data android:scheme="' + s + '" />',
+                      '            </intent-filter>',
+                    ].join('\n'),
+                )
+                .join('\n');
+              const hostFilters = [...hosts]
+                .filter((h) => !manifest.includes('android:host="' + h + '"'))
+                .map((h) =>
+                  [
+                    '            <intent-filter android:autoVerify="true">',
+                    '                <action android:name="android.intent.action.VIEW" />',
+                    '                <category android:name="android.intent.category.DEFAULT" />',
+                    '                <category android:name="android.intent.category.BROWSABLE" />',
+                    '                <data android:scheme="https" android:host="' + h + '" />',
+                    '            </intent-filter>',
+                  ].join('\n'),
+                )
+                .join('\n');
+              const injected = filters + (hostFilters ? '\n' + hostFilters : '');
+              const activityClose = manifest.match(/<\/activity>/);
+              if (activityClose) {
+                manifest = manifest.replace(/<\/activity>/, injected + '\n        </activity>');
+                fixes.push('Added deep-link intent filters for: ' + missingSchemes.join(', ') + ([...hosts].length ? ' + hosts ' + [...hosts].join(', ') : ''));
+              } else {
+                problems.push('Could not locate the main <activity> in AndroidManifest.xml to add deep-link intent filters.');
+              }
+            }
+            if (!/android:launchMode="singleTask"/.test(manifest)) {
+              manifest = manifest.replace(/(<activity\b[^>]*?)(>)/, '$1\n            android:launchMode="singleTask"$2');
+              fixes.push('Set launchMode=singleTask so OAuth callbacks reuse the running activity');
+            }
+            fs.writeFileSync(manifestPath, manifest);
+            log('[deeplinks] Schemes configured: ' + ([...schemes].join(', ') || 'none'));
+            if (hosts.size) log('[deeplinks] App Link hosts: ' + [...hosts].join(', '));
+            fs.writeFileSync('android-expected-schemes.txt', [...schemes].join('\n'));
+          }
+
+          // ---- Auth provider detection (informational + PKCE sanity) ----
+          const authLibs = deps.filter((d) => /supabase|firebase|auth0|@clerk|amazon-cognito|amplify|msal|next-auth|oidc-client/.test(d));
+          if (authLibs.length) {
+            log('[auth] Detected auth SDKs: ' + authLibs.join(', '));
+            log('[auth] Native OAuth callbacks will resolve through the scheme(s) above (PKCE-compatible).');
+            if (![...schemes].length) problems.push('An auth SDK was detected but no URL scheme could be derived for native OAuth callbacks.');
+          } else {
+            notes.push('[auth] No auth SDK detected — deep links still configured from the bundle id.');
+          }
+
+          for (const n of notes) log(n);
+          for (const f of fixes) log('[auto-fix] ' + f);
+          if (problems.length) {
+            for (const p of problems) log('[blocking] ' + p);
+            log('PREBUILD_VALIDATION_FAILED: ' + problems[0]);
+            process.exit(1);
+          }
+          log('[validate] Native configuration validated');
+          NODEEOF
+          node /tmp/apkforge-native-check.cjs
+          echo "PREBUILD_VALIDATION_PASSED" | tee -a "$REPORT"
+
       - name: Decode keystore
         run: |
           set -e
@@ -148,10 +439,10 @@ jobs:
         run: |
           set -euo pipefail
           KS="project/android/app/release.keystore"
-          REPORT="project/android-signing-diagnostics.txt"
-          : > "$REPORT"
+          REPORT_S="project/android-signing-diagnostics.txt"
+          : > "$REPORT_S"
 
-          log() { echo "$1" | tee -a "$REPORT"; }
+          log() { echo "$1" | tee -a "$REPORT_S"; }
           fail() { log "SIGNING_VALIDATION_FAILED: $1"; echo "::error::$1"; exit 1; }
 
           log "========== APKForge signing diagnostics =========="
@@ -180,32 +471,26 @@ jobs:
             if grep -Eiq "Invalid keystore format|Unrecognized keystore format|toDerInputStream rejects tag|not a keystore" "$LIST_OUT"; then
               fail "Corrupted or unsupported keystore file. Upload a valid JKS or PKCS12 keystore."
             fi
-            fail "Unable to read keystore: $(tail -n 5 "$LIST_OUT" | tr '
-' ' ' | sed 's/::/:/g')"
+            fail "Unable to read keystore: $(tail -n 5 "$LIST_OUT" | tr '\n' ' ' | sed 's/::/:/g')"
           fi
           log "Keystore password: valid"
 
           ALIASES="$(grep -E '^Alias name:' "$LIST_OUT" | sed 's/^Alias name: //' | sed '/^$/d')"
-          ALIAS_COUNT="$(printf '%s
-' "$ALIASES" | sed '/^$/d' | wc -l | tr -d ' ')"
+          ALIAS_COUNT="$(printf '%s\n' "$ALIASES" | sed '/^$/d' | wc -l | tr -d ' ')"
           if [ "$ALIAS_COUNT" = "0" ]; then
             fail "No signing aliases found in the keystore. Upload a keystore containing a private key entry."
           fi
           log "Aliases found ($ALIAS_COUNT):"
-          printf '%s
-' "$ALIASES" | sed 's/^/- /' | tee -a "$REPORT"
+          printf '%s\n' "$ALIASES" | sed 's/^/- /' | tee -a "$REPORT_S"
 
           FINAL_ALIAS="${CONFIGURED_ALIAS:-}"
-          if [ -n "$FINAL_ALIAS" ] && printf '%s
-' "$ALIASES" | grep -Fx -- "$FINAL_ALIAS" >/dev/null; then
+          if [ -n "$FINAL_ALIAS" ] && printf '%s\n' "$ALIASES" | grep -Fx -- "$FINAL_ALIAS" >/dev/null; then
             log "Configured alias: found"
           elif [ "$ALIAS_COUNT" = "1" ]; then
-            FINAL_ALIAS="$(printf '%s
-' "$ALIASES" | head -n 1)"
+            FINAL_ALIAS="$(printf '%s\n' "$ALIASES" | head -n 1)"
             log "Configured alias was missing or blank; auto-selected only alias: $FINAL_ALIAS"
           else
-            AVAILABLE_ALIASES="$(printf '%s
-' "$ALIASES" | paste -sd ', ' -)"
+            AVAILABLE_ALIASES="$(printf '%s\n' "$ALIASES" | paste -sd ', ' -)"
             log "Configured alias: missing"
             fail "Configured key alias does not exist in the keystore. Available aliases: $AVAILABLE_ALIASES. Update the keystore alias in Settings."
           fi
@@ -218,29 +503,104 @@ jobs:
             if grep -Eiq "Alias <.*> does not exist|does not exist" "$KEY_OUT"; then
               fail "Alias '$FINAL_ALIAS' does not exist in the keystore."
             fi
-            fail "Unable to validate key password for alias '$FINAL_ALIAS': $(tail -n 5 "$KEY_OUT" | tr '
-' ' ' | sed 's/::/:/g')"
+            fail "Unable to validate key password for alias '$FINAL_ALIAS': $(tail -n 5 "$KEY_OUT" | tr '\n' ' ' | sed 's/::/:/g')"
           fi
           log "Key password: valid"
           log "Final signing alias: $FINAL_ALIAS"
           log "SIGNING_VALIDATION_PASSED"
           log "========== APKForge signing diagnostics complete =========="
           echo "APKFORGE_VALIDATED_KEY_ALIAS=$FINAL_ALIAS" >> "$GITHUB_ENV"
+
       - name: Gradle build
         working-directory: project/android
         env:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
         run: |
+          set -e
           chmod +x ./gradlew
+          ./gradlew --version | sed -n '1,8p' | tee -a "$REPORT"
           ./gradlew --no-daemon clean
           ./gradlew --no-daemon assembleRelease \
             -Pandroid.injected.signing.store.file=${{ github.workspace }}/project/android/app/release.keystore \
             -Pandroid.injected.signing.store.password="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}" \
             -Pandroid.injected.signing.key.alias="$APKFORGE_VALIDATED_KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="${{ secrets.APKFORGE_KEY_PASSWORD }}"
+
+      - name: Verify release APK
+        working-directory: project
+        run: |
+          set -e
+          VERIFY="android-apk-verification.txt"
+          : > "$VERIFY"
+          log() { echo "$1" | tee -a "$VERIFY"; }
+          fail() { log "APK_VERIFICATION_FAILED: $1"; echo "::error::$1"; exit 1; }
+
+          APK="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1 || true)"
+          [ -n "$APK" ] || fail "No release APK was produced by Gradle."
+          log "========== APKForge APK verification =========="
+          log "APK: $APK ($(wc -c < "$APK") bytes)"
+
+          BT_DIR="$(ls -d ${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          AAPT2="$BT_DIR/aapt2"; APKSIGNER="$BT_DIR/apksigner"
+
+          if [ -x "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
+            log "Signature: valid"
+          else
+            jarsigner -verify "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
+            log "Signature: valid (jarsigner)"
+          fi
+
+          if [ -x "$AAPT2" ]; then
+            "$AAPT2" dump badging "$APK" > /tmp/badging.txt 2>&1 || fail "Could not read the APK manifest."
+            PKG="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" /tmp/badging.txt | head -n 1)"
+            log "Package: $PKG (expected $BUNDLE_ID)"
+            [ "$PKG" = "$BUNDLE_ID" ] || fail "APK package '$PKG' does not match the configured bundle id '$BUNDLE_ID'."
+
+            "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > /tmp/xmltree.txt 2>&1 || true
+            grep -q "android.intent.action.VIEW" /tmp/xmltree.txt || fail "The APK contains no deep-link intent filter (VIEW action)."
+            grep -q "android.intent.category.BROWSABLE" /tmp/xmltree.txt || fail "The APK deep-link intent filter is not BROWSABLE, so OAuth callbacks cannot return to the app."
+            log "Deep-link intent filters: present"
+
+            if [ -f android-expected-schemes.txt ]; then
+              while read -r s; do
+                [ -n "$s" ] || continue
+                if grep -qi "\"$s\"" /tmp/xmltree.txt; then
+                  log "Scheme present: $s://"
+                else
+                  fail "Expected URL scheme '$s://' is missing from the built APK."
+                fi
+              done < android-expected-schemes.txt
+            fi
+
+            grep -Eqi "BridgeActivity|MainActivity" /tmp/xmltree.txt || fail "No Capacitor bridge activity found in the APK manifest."
+            log "Capacitor bridge activity: present"
+          else
+            log "WARNING: aapt2 not available — skipped manifest introspection"
+          fi
+
+          unzip -l "$APK" | grep -q "assets/public/index.html" || fail "Web assets are missing from the APK (assets/public/index.html not found)."
+          log "Web assets: bundled"
+          unzip -p "$APK" assets/capacitor.plugins.json 2>/dev/null | tee -a "$VERIFY" || log "capacitor.plugins.json not present (no third-party plugins)"
+          log "APK_VERIFICATION_PASSED"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.build_id }}
-          path: project/android/app/build/outputs/apk/release/*.apk
+          path: |
+            project/android/app/build/outputs/apk/release/*.apk
+            project/android-prebuild-report.txt
+            project/android-signing-diagnostics.txt
+            project/android-apk-verification.txt
           if-no-files-found: error
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ github.event.inputs.build_id }}
+          path: |
+            project/android-prebuild-report.txt
+            project/android-signing-diagnostics.txt
+            project/android-apk-verification.txt
+          if-no-files-found: ignore
