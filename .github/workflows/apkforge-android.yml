@@ -28,7 +28,7 @@ jobs:
           curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
           mkdir project
           unzip -q source.zip -d project
-      - name: Install & inject Capacitor (Android)
+      - name: Install & validate Capacitor Android project
         working-directory: project
         env:
           APP_NAME: ${{ github.event.inputs.app_name }}
@@ -37,24 +37,79 @@ jobs:
           PROJECT_KIND: ${{ github.event.inputs.project_kind }}
         run: |
           set -e
+          echo "========== APKForge Android pre-build diagnostics =========="
+          echo "Node: $(node --version)"
+          echo "npm: $(npm --version)"
+          echo "Java: $(java -version 2>&1 | head -n 1)"
+          echo "ANDROID_HOME: ${ANDROID_HOME:-not set}"
+          if command -v sdkmanager >/dev/null 2>&1; then sdkmanager --version || true; fi
+
           if [ ! -f package.json ]; then
             echo '{"name":"apkforge-app","version":"1.0.0","private":true}' > package.json
           fi
-          npm install --no-audit --no-fund || npm install --no-audit --no-fund --legacy-peer-deps
-          if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
+
+          PM="npm"
+          INSTALL_CMD="npm install --no-audit --no-fund"
+          RUN_CMD="npm run"
+          EXEC_CMD="npx"
+          if [ -f bun.lockb ] || [ -f bun.lock ]; then
+            PM="bun"
+            if ! command -v bun >/dev/null 2>&1; then npm install -g bun; fi
+            INSTALL_CMD="bun install"
+            RUN_CMD="bun run"
+            EXEC_CMD="bunx"
+          elif [ -f pnpm-lock.yaml ]; then
+            PM="pnpm"
+            corepack enable
+            corepack prepare pnpm@latest --activate
+            INSTALL_CMD="pnpm install --no-frozen-lockfile"
+            RUN_CMD="pnpm run"
+            EXEC_CMD="pnpm exec"
+          fi
+          echo "Package manager: $PM"
+          $INSTALL_CMD || { echo "Primary dependency install failed; retrying with npm legacy peer deps"; npm install --no-audit --no-fund --legacy-peer-deps; }
+
+          if node -e "require.resolve('@capacitor/cli')" 2>/dev/null; then
+            CAP="$EXEC_CMD cap"
+          else
             npm i @capacitor/core @capacitor/cli
+            CAP="npx cap"
+          fi
+          echo "Capacitor: $($CAP --version 2>/dev/null || echo unknown)"
+
+          if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
             mkdir -p "$WEB_DIR"
             [ -f "$WEB_DIR/index.html" ] || echo "<!doctype html><html><body><h1>$APP_NAME</h1></body></html>" > "$WEB_DIR/index.html"
-            npx cap init "$APP_NAME" "$BUNDLE_ID" --web-dir="$WEB_DIR"
+            $CAP init "$APP_NAME" "$BUNDLE_ID" --web-dir="$WEB_DIR"
           fi
           npm i @capacitor/android || true
           if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
-            npm run build || echo "build script failed — continuing with existing web assets"
+            $RUN_CMD build || echo "build script failed — continuing with existing web assets"
           fi
           if [ ! -d android ]; then
-            npx cap add android
+            $CAP add android
           fi
-          npx cap sync android || true
+          $CAP sync android
+
+          if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
+            echo "::error::Missing capacitor.config after initialization."
+            exit 1
+          fi
+          if [ ! -f android/app/src/main/AndroidManifest.xml ]; then
+            echo "::error::AndroidManifest.xml was not generated."
+            exit 1
+          fi
+          if [ ! -f android/gradlew ]; then
+            echo "::error::Gradle wrapper is missing from android project."
+            exit 1
+          fi
+          chmod +x android/gradlew
+          echo "Gradle:"
+          (cd android && ./gradlew --version | sed -n '1,8p')
+          echo "Android package config:"
+          grep -R "namespace |applicationId " -n android/app/build.gradle* 2>/dev/null | head -n 5 || true
+          echo "Capacitor plugins: $(node -e "const p=require('./package.json'); console.log(Object.keys({...p.dependencies,...p.devDependencies}).filter(x=>x.includes('capacitor')).join(', ') || 'none')")"
+          echo "========== APKForge Android pre-build diagnostics complete =========="
       - name: Resolve app icon
         working-directory: project
         env:
@@ -82,17 +137,106 @@ jobs:
           fi
       - name: Decode keystore
         run: |
+          set -e
+          mkdir -p project/android/app
           echo "${{ secrets.APKFORGE_KEYSTORE_B64 }}" | base64 -d > project/android/app/release.keystore
+      - name: Validate Android signing
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.APKFORGE_KEY_PASSWORD }}
+          CONFIGURED_ALIAS: ${{ secrets.APKFORGE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KS="project/android/app/release.keystore"
+          REPORT="project/android-signing-diagnostics.txt"
+          : > "$REPORT"
+
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { log "SIGNING_VALIDATION_FAILED: $1"; echo "::error::$1"; exit 1; }
+
+          log "========== APKForge signing diagnostics =========="
+          log "Keystore path: $KS"
+          if [ ! -f "$KS" ]; then
+            fail "Missing keystore file after decode. Re-upload the Android keystore in Settings."
+          fi
+          if [ ! -s "$KS" ]; then
+            fail "Decoded keystore is empty. Re-upload a valid .jks or .keystore file."
+          fi
+          log "Keystore exists: yes"
+          log "Keystore size: $(wc -c < "$KS") bytes"
+
+          if [ -z "${KEYSTORE_PASSWORD:-}" ]; then
+            fail "Missing keystore password. Update the keystore in Settings."
+          fi
+          if [ -z "${KEY_PASSWORD:-}" ]; then
+            fail "Missing key password. Update the keystore in Settings."
+          fi
+
+          LIST_OUT="$(mktemp)"
+          if ! keytool -list -v -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" > "$LIST_OUT" 2>&1; then
+            if grep -Eiq "password was incorrect|keystore password was incorrect|tampered with|integrity check failed" "$LIST_OUT"; then
+              fail "Invalid keystore password. The saved store password does not open this keystore."
+            fi
+            if grep -Eiq "Invalid keystore format|Unrecognized keystore format|toDerInputStream rejects tag|not a keystore" "$LIST_OUT"; then
+              fail "Corrupted or unsupported keystore file. Upload a valid JKS or PKCS12 keystore."
+            fi
+            fail "Unable to read keystore: $(tail -n 5 "$LIST_OUT" | tr '
+' ' ' | sed 's/::/:/g')"
+          fi
+          log "Keystore password: valid"
+
+          ALIASES="$(grep -E '^Alias name:' "$LIST_OUT" | sed 's/^Alias name: //' | sed '/^$/d')"
+          ALIAS_COUNT="$(printf '%s
+' "$ALIASES" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$ALIAS_COUNT" = "0" ]; then
+            fail "No signing aliases found in the keystore. Upload a keystore containing a private key entry."
+          fi
+          log "Aliases found ($ALIAS_COUNT):"
+          printf '%s
+' "$ALIASES" | sed 's/^/- /' | tee -a "$REPORT"
+
+          FINAL_ALIAS="${CONFIGURED_ALIAS:-}"
+          if [ -n "$FINAL_ALIAS" ] && printf '%s
+' "$ALIASES" | grep -Fx -- "$FINAL_ALIAS" >/dev/null; then
+            log "Configured alias: found"
+          elif [ "$ALIAS_COUNT" = "1" ]; then
+            FINAL_ALIAS="$(printf '%s
+' "$ALIASES" | head -n 1)"
+            log "Configured alias was missing or blank; auto-selected only alias: $FINAL_ALIAS"
+          else
+            AVAILABLE_ALIASES="$(printf '%s
+' "$ALIASES" | paste -sd ', ' -)"
+            log "Configured alias: missing"
+            fail "Configured key alias does not exist in the keystore. Available aliases: $AVAILABLE_ALIASES. Update the keystore alias in Settings."
+          fi
+
+          KEY_OUT="$(mktemp)"
+          if ! keytool -certreq -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -alias "$FINAL_ALIAS" -keypass "$KEY_PASSWORD" -file /tmp/apkforge-signing-validation.csr > "$KEY_OUT" 2>&1; then
+            if grep -Eiq "Cannot recover key|password was incorrect|Given final block not properly padded|pad block corrupted" "$KEY_OUT"; then
+              fail "Invalid key password for alias '$FINAL_ALIAS'. Update the key password in Settings."
+            fi
+            if grep -Eiq "Alias <.*> does not exist|does not exist" "$KEY_OUT"; then
+              fail "Alias '$FINAL_ALIAS' does not exist in the keystore."
+            fi
+            fail "Unable to validate key password for alias '$FINAL_ALIAS': $(tail -n 5 "$KEY_OUT" | tr '
+' ' ' | sed 's/::/:/g')"
+          fi
+          log "Key password: valid"
+          log "Final signing alias: $FINAL_ALIAS"
+          log "SIGNING_VALIDATION_PASSED"
+          log "========== APKForge signing diagnostics complete =========="
+          echo "APKFORGE_VALIDATED_KEY_ALIAS=$FINAL_ALIAS" >> "$GITHUB_ENV"
       - name: Gradle build
         working-directory: project/android
         env:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
         run: |
           chmod +x ./gradlew
+          ./gradlew --no-daemon clean
           ./gradlew --no-daemon assembleRelease \
             -Pandroid.injected.signing.store.file=${{ github.workspace }}/project/android/app/release.keystore \
             -Pandroid.injected.signing.store.password="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.APKFORGE_KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.alias="$APKFORGE_VALIDATED_KEY_ALIAS" \
             -Pandroid.injected.signing.key.password="${{ secrets.APKFORGE_KEY_PASSWORD }}"
       - name: Upload APK
         uses: actions/upload-artifact@v4
