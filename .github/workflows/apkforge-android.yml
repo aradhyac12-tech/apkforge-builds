@@ -11,6 +11,9 @@ on:
       web_dir: { description: Web build output directory, required: false, default: "www" }
       logo_url: { description: Optional signed URL to a square app icon (PNG), required: false, default: "" }
       node_version: { description: Node.js major version (20-24), required: false, default: "22" }
+      finalize_endpoint: { description: APKForge backend finalization endpoint, required: false, default: "" }
+      diagnostic_endpoint: { description: APKForge sanitized runtime diagnostics endpoint, required: false, default: "" }
+      diagnostic_token: { description: APKForge per-build diagnostics token, required: false, default: "" }
 
 jobs:
   build:
@@ -21,6 +24,10 @@ jobs:
       BUNDLE_ID: ${{ github.event.inputs.bundle_id }}
       WEB_DIR: ${{ github.event.inputs.web_dir }}
       PROJECT_KIND: ${{ github.event.inputs.project_kind }}
+      BUILD_ID: ${{ github.event.inputs.build_id }}
+      FINALIZE_ENDPOINT: ${{ github.event.inputs.finalize_endpoint }}
+      DIAGNOSTIC_ENDPOINT: ${{ github.event.inputs.diagnostic_endpoint }}
+      DIAGNOSTIC_TOKEN: ${{ github.event.inputs.diagnostic_token }}
       REPORT: ${{ github.workspace }}/project/android-prebuild-report.txt
     steps:
       - name: Setup Node
@@ -151,6 +158,135 @@ jobs:
           fi
           log "[web] Web directory: $RESOLVED"
           echo "RESOLVED_WEB_DIR=$RESOLVED" >> "$GITHUB_ENV"
+
+      - name: Inject OAuth callback diagnostics
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          if [ -z "${DIAGNOSTIC_ENDPOINT:-}" ] || [ -z "${DIAGNOSTIC_TOKEN:-}" ]; then
+            log "[oauth-diagnostics] No diagnostics endpoint configured — skipping web runtime instrumentation"
+            exit 0
+          fi
+          INDEX="$RESOLVED_WEB_DIR/index.html"
+          if [ ! -f "$INDEX" ]; then
+            log "[oauth-diagnostics] index.html not found at $INDEX — skipping web runtime instrumentation"
+            exit 0
+          fi
+          cat > /tmp/apkforge-oauth-diagnostics.js <<'JSEOF'
+          (function () {
+            var endpoint = '__APKFORGE_DIAGNOSTIC_ENDPOINT__';
+            var token = '__APKFORGE_DIAGNOSTIC_TOKEN__';
+            var buildId = '__APKFORGE_BUILD_ID__';
+            if (!endpoint || !token || window.__apkforgeOAuthDiagnostics) return;
+            window.__apkforgeOAuthDiagnostics = true;
+            var seen = Object.create(null);
+            function cleanUrl(value) {
+              try {
+                var url = new URL(String(value || ''));
+                var queryKeys = [];
+                url.searchParams.forEach(function (_, key) {
+                  if (!/token|secret|password|refresh|access/i.test(key)) queryKeys.push(key);
+                });
+                return {
+                  scheme: url.protocol.replace(':', ''),
+                  host: url.host,
+                  path: url.pathname,
+                  hasCode: url.searchParams.has('code'),
+                  hasError: url.searchParams.has('error'),
+                  hashKeys: url.hash ? url.hash.replace(/^#/, '').split('&').map(function (p) { return p.split('=')[0]; }).filter(function (k) { return !/token|secret|password|refresh|access/i.test(k); }).slice(0, 20) : [],
+                  queryKeys: queryKeys.slice(0, 20)
+                };
+              } catch (err) {
+                return { malformed: true, message: String(err && err.message || err || 'parse error') };
+              }
+            }
+            function send(stage, extra) {
+              try {
+                var body = JSON.stringify({ token: token, buildId: buildId, stage: stage, at: new Date().toISOString(), extra: extra || {} });
+                if (navigator.sendBeacon) {
+                  var blob = new Blob([body], { type: 'application/json' });
+                  if (navigator.sendBeacon(endpoint, blob)) return;
+                }
+                fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body, keepalive: true }).catch(function () {});
+              } catch (_) {}
+            }
+            send('web-runtime-loaded', { native: !!window.Capacitor, path: location.pathname });
+            window.addEventListener('error', function (event) {
+              send('window-error', { message: String(event.message || 'unknown'), source: event.filename ? String(event.filename).split('/').pop() : '', line: event.lineno || 0, col: event.colno || 0 });
+            });
+            window.addEventListener('unhandledrejection', function (event) {
+              var reason = event.reason;
+              send('unhandled-rejection', { message: String(reason && reason.message || reason || 'unknown') });
+            });
+            try {
+              var originalSetItem = Storage.prototype.setItem;
+              Storage.prototype.setItem = function (key, value) {
+                if (/auth-token|supabase|session/i.test(String(key || ''))) {
+                  send('session-storage-write', { key: String(key || '').slice(0, 96), bytes: String(value || '').length });
+                }
+                return originalSetItem.apply(this, arguments);
+              };
+            } catch (_) {}
+            try {
+              var originalFetch = window.fetch;
+              window.fetch = function (input, init) {
+                var url = typeof input === 'string' ? input : input && input.url;
+                var isToken = //auth/v1/token/i.test(String(url || ''));
+                if (isToken) send('exchangeCodeForSession-fetch-start', { endpoint: cleanUrl(url), method: (init && init.method) || 'POST' });
+                return originalFetch.apply(this, arguments).then(function (response) {
+                  if (isToken) send('exchangeCodeForSession-fetch-done', { status: response.status, ok: response.ok });
+                  return response;
+                }, function (err) {
+                  if (isToken) send('exchangeCodeForSession-fetch-throw', { message: String(err && err.message || err || 'fetch failed') });
+                  throw err;
+                });
+              };
+            } catch (_) {}
+            function hookAppPlugin() {
+              try {
+                var cap = window.Capacitor;
+                var app = cap && cap.Plugins && cap.Plugins.App;
+                if (!app && window.CapacitorApp) app = window.CapacitorApp;
+                if (app && app.addListener && !window.__apkforgeAppUrlOpenHooked) {
+                  window.__apkforgeAppUrlOpenHooked = true;
+                  app.addListener('appUrlOpen', function (event) {
+                    var info = cleanUrl(event && event.url);
+                    var key = [info.scheme, info.host, info.path, info.hasCode, info.hasError].join('|');
+                    send(seen[key] ? 'appUrlOpen-duplicate' : 'appUrlOpen', info);
+                    seen[key] = true;
+                  });
+                  send('appUrlOpen-listener-registered', {});
+                  return;
+                }
+              } catch (err) {
+                send('appUrlOpen-listener-error', { message: String(err && err.message || err || 'listener failed') });
+              }
+              setTimeout(hookAppPlugin, 500);
+            }
+            hookAppPlugin();
+          })();
+          JSEOF
+          node - <<'NODEEOF'
+          const fs = require('fs');
+          const indexPath = process.env.RESOLVED_WEB_DIR + '/index.html';
+          let html = fs.readFileSync(indexPath, 'utf8');
+          if (html.includes('__apkforgeOAuthDiagnostics')) {
+            console.log('[oauth-diagnostics] Runtime instrumentation already present');
+            process.exit(0);
+          }
+          let script = fs.readFileSync('/tmp/apkforge-oauth-diagnostics.js', 'utf8')
+            .replaceAll('__APKFORGE_DIAGNOSTIC_ENDPOINT__', process.env.DIAGNOSTIC_ENDPOINT || '')
+            .replaceAll('__APKFORGE_DIAGNOSTIC_TOKEN__', process.env.DIAGNOSTIC_TOKEN || '')
+            .replaceAll('__APKFORGE_BUILD_ID__', process.env.BUILD_ID || '');
+          const tag = '<script>' + script + '</script>';
+          html = /</body>/i.test(html) ? html.replace(/</body>/i, tag + '
+</body>') : html + '
+' + tag;
+          fs.writeFileSync(indexPath, html);
+          console.log('[oauth-diagnostics] Injected sanitized callback diagnostics into ' + indexPath);
+          NODEEOF
+          log "[oauth-diagnostics] Sanitized runtime diagnostics injected"
 
       - name: Generate or repair native Android project
         working-directory: project
@@ -426,6 +562,145 @@ jobs:
           node /tmp/apkforge-native-check.cjs
           echo "PREBUILD_VALIDATION_PASSED" | tee -a "$REPORT"
 
+      - name: Inject Android lifecycle diagnostics
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          cat > /tmp/apkforge-mainactivity-diagnostics.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const report = process.env.REPORT;
+          const log = (m) => { console.log(m); fs.appendFileSync(report, m + '
+'); };
+          function walk(dir) {
+            const out = [];
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+            for (const e of entries) {
+              const full = path.join(dir, e.name);
+              if (e.isDirectory()) out.push(...walk(full));
+              else if (e.name === 'MainActivity.java') out.push(full);
+            }
+            return out;
+          }
+          const candidates = walk('android/app/src/main/java');
+          if (!candidates.length) throw new Error('MainActivity.java was not found in the native Android project.');
+          const mainPath = candidates[0];
+          let main = fs.readFileSync(mainPath, 'utf8');
+          const pkg = (main.match(/^s*packages+([^;]+);/m) || [])[1];
+          if (!pkg) throw new Error('MainActivity.java has no package declaration.');
+          const pkgDir = path.join('android/app/src/main/java', ...pkg.split('.'));
+          const helperPath = path.join(pkgDir, 'ApkforgeOAuthDiagnostics.java');
+          fs.mkdirSync(pkgDir, { recursive: true });
+          fs.writeFileSync(helperPath, [
+            'package ' + pkg + ';',
+            '',
+            'import android.app.Activity;',
+            'import android.content.Intent;',
+            'import android.net.Uri;',
+            'import android.util.Log;',
+            '',
+            'public final class ApkforgeOAuthDiagnostics {',
+            '    private static final String TAG = "APKForgeOAuth";',
+            '',
+            '    public static void logActivity(String stage, Activity activity, Intent intent) {',
+            '        try {',
+            '            Log.i(TAG, stage + " taskId=" + activity.getTaskId() + " finishing=" + activity.isFinishing() + " changingConfig=" + activity.isChangingConfigurations() + " intent=" + sanitize(intent));',
+            '        } catch (Throwable t) {',
+            '            Log.e(TAG, "diagnostic logger failed at " + stage, t);',
+            '        }',
+            '    }',
+            '',
+            '    private static String sanitize(Intent intent) {',
+            '        if (intent == null) return "none";',
+            '        Uri data = intent.getData();',
+            '        if (data == null) return "action=" + intent.getAction() + " data=none";',
+            '        StringBuilder keys = new StringBuilder();',
+            '        try {',
+            '            for (String name : data.getQueryParameterNames()) {',
+            '                String lower = name.toLowerCase();',
+            '                if (lower.contains("token") || lower.contains("secret") || lower.contains("password") || lower.contains("refresh") || lower.contains("access")) continue;',
+            '                if (keys.length() > 0) keys.append(',');',
+            '                keys.append(name);',
+            '            }',
+            '        } catch (Throwable ignored) {}',
+            '        return "action=" + intent.getAction() + " scheme=" + data.getScheme() + " host=" + data.getHost() + " path=" + data.getPath() + " queryKeys=" + keys;',
+            '    }',
+            '}',
+            ''
+          ].join('
+'));
+          function insertBeforeLastBrace(source, block) {
+            const idx = source.lastIndexOf('}');
+            if (idx < 0) throw new Error('MainActivity.java is malformed; missing class closing brace.');
+            return source.slice(0, idx) + block + '
+' + source.slice(idx);
+          }
+          function injectIntoMethod(source, regex, line) {
+            const match = regex.exec(source);
+            if (!match) return null;
+            const open = source.indexOf('{', match.index);
+            if (open < 0) return source;
+            if (source.slice(open, open + 240).includes(line)) return source;
+            return source.slice(0, open + 1) + '
+        ' + line + source.slice(open + 1);
+          }
+          const needsBundle = /voids+onCreates*(/.test(main) && !/imports+android.os.Bundle;/.test(main);
+          const needsIntent = /voids+onNewIntents*(/.test(main) && !/imports+android.content.Intent;/.test(main);
+          if (needsBundle || needsIntent) {
+            main = main.replace(/(packages+[^;]+;s*)/, '$1
+' + (needsIntent ? 'import android.content.Intent;
+' : '') + (needsBundle ? 'import android.os.Bundle;
+' : ''));
+          }
+          if (/ApkforgeOAuthDiagnostics/.test(main)) {
+            log('[oauth-diagnostics] MainActivity lifecycle diagnostics already present');
+          } else {
+            let patched = injectIntoMethod(main, /(?:public|protected)s+voids+onCreates*([^)]*)/, 'ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '
+    @Override
+    protected void onCreate(android.os.Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());
+    }
+');
+            patched = injectIntoMethod(main, /(?:public|protected)s+voids+onNewIntents*([^)]*)/, 'ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);
+    }
+');
+            patched = injectIntoMethod(main, /(?:public|protected)s+voids+onResumes*([^)]*)/, 'ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '
+    @Override
+    protected void onResume() {
+        super.onResume();
+        ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());
+    }
+');
+            patched = injectIntoMethod(main, /(?:public|protected)s+voids+onDestroys*([^)]*)/, 'ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '
+    @Override
+    protected void onDestroy() {
+        ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());
+        super.onDestroy();
+    }
+');
+            fs.writeFileSync(mainPath, main);
+            log('[oauth-diagnostics] Injected Android lifecycle diagnostics into ' + mainPath);
+          }
+          log('[oauth-diagnostics] Created sanitized logcat helper at ' + helperPath);
+          NODEEOF
+          node /tmp/apkforge-mainactivity-diagnostics.cjs
+
       - name: Decode keystore
         run: |
           set -e
@@ -584,7 +859,39 @@ jobs:
           unzip -p "$APK" assets/capacitor.plugins.json 2>/dev/null | tee -a "$VERIFY" || log "capacitor.plugins.json not present (no third-party plugins)"
           log "APK_VERIFICATION_PASSED"
 
+      - name: Runtime OAuth callback smoke test
+        uses: reactivecircus/android-emulator-runner@v2
+        timeout-minutes: 15
+        continue-on-error: true
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          script: |
+            set -e
+            cd project
+            RUNTIME="android-oauth-runtime-logcat.txt"
+            : > "$RUNTIME"
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1 || true)"
+            if [ -z "$APK" ]; then echo "OAUTH_RUNTIME_FAILED: release APK missing" | tee -a "$RUNTIME"; exit 1; fi
+            SCHEME="$(head -n 1 android-expected-schemes.txt 2>/dev/null || true)"
+            if [ -z "$SCHEME" ]; then SCHEME="$(echo "$BUNDLE_ID" | tr '[:upper:]' '[:lower:]')"; fi
+            adb logcat -c || true
+            adb install -r "$APK" | tee -a "$RUNTIME"
+            adb shell monkey -p "$BUNDLE_ID" 1 | tee -a "$RUNTIME" || true
+            sleep 5
+            adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$SCHEME://auth?code=apkforge_smoke_code&state=apkforge_smoke" "$BUNDLE_ID" | tee -a "$RUNTIME" || true
+            sleep 8
+            adb logcat -d -v time > "$RUNTIME" || true
+            grep -E "APKForgeOAuth|AndroidRuntime|FATAL EXCEPTION|Process.*$BUNDLE_ID|Capacitor|appUrlOpen|exchangeCodeForSession" "$RUNTIME" > android-oauth-runtime-summary.txt || true
+            if grep -E "FATAL EXCEPTION|AndroidRuntime|Process.*$BUNDLE_ID.*(has died|crash)" "$RUNTIME" >/dev/null; then
+              echo "OAUTH_RUNTIME_FAILED: Android crashed while handling the native OAuth callback. See android-oauth-runtime-logcat.txt." | tee -a android-oauth-runtime-summary.txt
+              exit 1
+            fi
+            echo "OAUTH_RUNTIME_SMOKE_PASSED: native callback intent did not crash the app" | tee -a android-oauth-runtime-summary.txt
+
       - name: Upload APK
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.build_id }}
@@ -593,6 +900,8 @@ jobs:
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
+            project/android-oauth-runtime-logcat.txt
+            project/android-oauth-runtime-summary.txt
           if-no-files-found: error
       - name: Upload diagnostics on failure
         if: failure()
@@ -603,4 +912,24 @@ jobs:
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
+            project/android-oauth-runtime-logcat.txt
+            project/android-oauth-runtime-summary.txt
           if-no-files-found: ignore
+      - name: Finalize APKForge build
+        if: always()
+        run: |
+          set +e
+          if [ -z "${FINALIZE_ENDPOINT:-}" ] || [ -z "${DIAGNOSTIC_TOKEN:-}" ]; then
+            echo "APKForge finalize skipped: no endpoint/token"
+            exit 0
+          fi
+          python3 - <<'PYEOF' > /tmp/apkforge-finalize.json
+          import json, os
+          print(json.dumps({
+            "buildId": os.environ.get("BUILD_ID", ""),
+            "token": os.environ.get("DIAGNOSTIC_TOKEN", ""),
+            "runId": os.environ.get("GITHUB_RUN_ID", ""),
+            "jobStatus": "${{ job.status }}",
+          }))
+          PYEOF
+          curl -fsS -X POST "$FINALIZE_ENDPOINT" -H 'content-type: application/json' --data-binary @/tmp/apkforge-finalize.json || true
