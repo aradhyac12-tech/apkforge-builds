@@ -618,7 +618,7 @@ jobs:
             '            for (String name : data.getQueryParameterNames()) {',
             '                String lower = name.toLowerCase();',
             '                if (lower.contains("token") || lower.contains("secret") || lower.contains("password") || lower.contains("refresh") || lower.contains("access")) continue;',
-            '                if (keys.length() > 0) keys.append(',');',
+            '                if (keys.length() > 0) keys.append(",");',
             '                keys.append(name);',
             '            }',
             '        } catch (Throwable ignored) {}',
@@ -653,13 +653,13 @@ jobs:
             else main = insertBeforeLastBrace(main, '\n    @Override\n    protected void onCreate(android.os.Bundle savedInstanceState) {\n        super.onCreate(savedInstanceState);\n        ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());\n    }\n');
             patched = injectIntoMethod(main, /(?:public|protected)\s+void\s+onNewIntent\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);');
             if (patched) main = patched;
-            else main = insertBeforeLastBrace(main, '\n    @Override\n    protected void onNewIntent(android.content.Intent intent) {\n        super.onNewIntent(intent);\n        setIntent(intent);\n        ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);\n    }\n');
+            else main = insertBeforeLastBrace(main, '\n    @Override\n    public void onNewIntent(android.content.Intent intent) {\n        super.onNewIntent(intent);\n        setIntent(intent);\n        ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);\n    }\n');
             patched = injectIntoMethod(main, /(?:public|protected)\s+void\s+onResume\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());');
             if (patched) main = patched;
-            else main = insertBeforeLastBrace(main, '\n    @Override\n    protected void onResume() {\n        super.onResume();\n        ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());\n    }\n');
+            else main = insertBeforeLastBrace(main, '\n    @Override\n    public void onResume() {\n        super.onResume();\n        ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());\n    }\n');
             patched = injectIntoMethod(main, /(?:public|protected)\s+void\s+onDestroy\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());');
             if (patched) main = patched;
-            else main = insertBeforeLastBrace(main, '\n    @Override\n    protected void onDestroy() {\n        ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());\n        super.onDestroy();\n    }\n');
+            else main = insertBeforeLastBrace(main, '\n    @Override\n    public void onDestroy() {\n        ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());\n        super.onDestroy();\n    }\n');
             fs.writeFileSync(mainPath, main);
             log('[oauth-diagnostics] Injected Android lifecycle diagnostics into ' + mainPath);
           }
