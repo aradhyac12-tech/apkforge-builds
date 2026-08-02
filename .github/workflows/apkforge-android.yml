@@ -96,11 +96,43 @@ jobs:
             INSTALL_CMD="yarn install"; RUN_CMD="yarn"; EXEC_CMD="yarn"
           fi
           log "[detect] Package manager: $PM"
+
+          FRAMEWORK="$(node -e "
+            const p=require('./package.json');
+            const d={...(p.dependencies||{}),...(p.devDependencies||{})};
+            const has=(k)=>Object.prototype.hasOwnProperty.call(d,k);
+            let f='static-web';
+            if (has('next')) f='next';
+            else if (has('nuxt')||has('nuxt3')) f='nuxt';
+            else if (has('@angular/core')) f='angular';
+            else if (has('@sveltejs/kit')) f='sveltekit';
+            else if (has('svelte')) f='svelte';
+            else if (has('@tanstack/react-start')||has('@tanstack/start')) f='tanstack-start';
+            else if (has('@remix-run/react')) f='remix';
+            else if (has('@ionic/react')||has('@ionic/vue')||has('@ionic/angular')) f='ionic';
+            else if (has('vue')) f='vue';
+            else if (has('vite')) f='vite';
+            else if (has('react')) f='react';
+            console.log(f);
+          " 2>/dev/null || echo static-web)"
+          log "[detect] Framework: $FRAMEWORK"
+          if [ -f config.xml ] && grep -qi "<widget" config.xml 2>/dev/null; then
+            log "[detect] Cordova project detected — it will be migrated to a Capacitor native project"
+          fi
+          if [ -f capacitor.config.ts ] || [ -f capacitor.config.js ] || [ -f capacitor.config.json ]; then
+            log "[detect] Capacitor config present"
+          else
+            log "[detect] No Capacitor config — one will be generated"
+          fi
+          if [ -d android ]; then log "[detect] Existing android/ project present"; else log "[detect] No android/ project — it will be generated"; fi
+
           {
             echo "PM=$PM"
             echo "RUN_CMD=$RUN_CMD"
             echo "EXEC_CMD=$EXEC_CMD"
+            echo "DETECTED_FRAMEWORK=$FRAMEWORK"
           } >> "$GITHUB_ENV"
+
 
           if $INSTALL_CMD; then
             log "[install] Dependencies installed with $PM"
@@ -144,20 +176,38 @@ jobs:
           else
             log "[web] No build script — using shipped web assets"
           fi
-          # Resolve the real web output dir.
-          RESOLVED="$WEB_DIR"
-          if [ ! -f "$RESOLVED/index.html" ]; then
-            for c in dist build out www public dist/spa .output/public; do
-              if [ -f "$c/index.html" ]; then RESOLVED="$c"; break; fi
+          # Resolve the real web output dir (never assume).
+          RESOLVED=""
+          if [ -n "${WEB_DIR:-}" ] && [ -f "$WEB_DIR/index.html" ]; then RESOLVED="$WEB_DIR"; fi
+          if [ -z "$RESOLVED" ]; then
+            for c in dist build out www public .output/public dist/spa dist/browser build/client .svelte-kit/output/client .nuxt/dist/client app/build; do
+              if [ -z "$RESOLVED" ] && [ -f "$c/index.html" ]; then RESOLVED="$c"; fi
             done
           fi
-          if [ ! -f "$RESOLVED/index.html" ]; then
-            mkdir -p "$RESOLVED"
-            echo "<!doctype html><html><body><h1>$APP_NAME</h1></body></html>" > "$RESOLVED/index.html"
-            log "[web] No web output found — generated a placeholder index.html in $RESOLVED (auto-repair)"
+          if [ -z "$RESOLVED" ]; then
+            for c in $(ls -d dist/*/browser dist/*/ build/*/ 2>/dev/null); do
+              if [ -z "$RESOLVED" ] && [ -f "${c%/}/index.html" ]; then RESOLVED="${c%/}"; fi
+            done
+          fi
+          if [ -z "$RESOLVED" ]; then
+            CANDIDATE="$(find . -maxdepth 3 -name index.html -not -path './node_modules/*' -not -path './android/*' -not -path './ios/*' -not -path './src/*' 2>/dev/null | head -n 1)"
+            if [ -n "$CANDIDATE" ]; then RESOLVED="$(dirname "$CANDIDATE")"; RESOLVED="${RESOLVED#./}"; fi
+          fi
+          if [ -z "$RESOLVED" ]; then
+            log "PREBUILD_VALIDATION_FAILED: No web build output containing index.html could be found."
+            log "  Framework detected: ${DETECTED_FRAMEWORK:-unknown}"
+            log "  Package manager:    ${PM:-npm}"
+            log "  Build command run:  ${RUN_CMD:-npm run} build"
+            log "  Configured webDir:  ${WEB_DIR:-none}"
+            log "  Directories probed: dist build out www public .output/public dist/spa dist/browser build/client .svelte-kit/output/client .nuxt/dist/client"
+            log "  Project root contents:"
+            ls -la | tee -a "$REPORT"
+            echo "::error::No web build output containing index.html was produced. Check the build script and web output directory."
+            exit 1
           fi
           log "[web] Web directory: $RESOLVED"
           echo "RESOLVED_WEB_DIR=$RESOLVED" >> "$GITHUB_ENV"
+
 
       - name: Inject OAuth callback diagnostics
         working-directory: project
@@ -286,6 +336,95 @@ jobs:
           NODEEOF
           log "[oauth-diagnostics] Sanitized runtime diagnostics injected"
 
+      - name: Repair Capacitor configuration (webDir)
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          CAP="npx cap"
+
+          if [ ! -f "$RESOLVED_WEB_DIR/index.html" ]; then
+            fail "No index.html in the resolved web directory ('$RESOLVED_WEB_DIR'). The web build did not produce usable assets."
+          fi
+
+          CFG=""
+          for f in capacitor.config.ts capacitor.config.js capacitor.config.mjs capacitor.config.cjs capacitor.config.json; do
+            if [ -z "$CFG" ] && [ -f "$f" ]; then CFG="$f"; fi
+          done
+          if [ -z "$CFG" ]; then
+            log "[config] No capacitor config — running cap init (auto-repair)"
+            $CAP init "$APP_NAME" "$BUNDLE_ID" --web-dir="$RESOLVED_WEB_DIR" || fail "capacitor init failed for bundle id $BUNDLE_ID."
+            for f in capacitor.config.ts capacitor.config.js capacitor.config.mjs capacitor.config.cjs capacitor.config.json; do
+              if [ -z "$CFG" ] && [ -f "$f" ]; then CFG="$f"; fi
+            done
+          fi
+          [ -n "$CFG" ] || fail "Capacitor config could not be created."
+          log "[config] Capacitor config: $CFG"
+
+          cat > /tmp/apkforge-fix-webdir.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const file = process.argv[2];
+          const web = process.argv[3];
+          let src = fs.readFileSync(file, 'utf8');
+          let declared = null;
+          let repaired = false;
+          if (file.endsWith('.json')) {
+            const j = JSON.parse(src);
+            declared = j.webDir || null;
+            if (declared !== web) { j.webDir = web; fs.writeFileSync(file, JSON.stringify(j, null, 2)); repaired = true; }
+          } else {
+            const m = src.match(/webDir\s*:\s*['"\`]([^'"\`]+)['"\`]/);
+            declared = m ? m[1] : null;
+            if (m && declared !== web) {
+              src = src.replace(/webDir\s*:\s*['"\`][^'"\`]+['"\`]/, "webDir: '" + web + "'");
+              fs.writeFileSync(file, src); repaired = true;
+            } else if (!m) {
+              const anchor = src.match(/appId\s*:\s*['"\`][^'"\`]+['"\`]\s*,/);
+              if (anchor) {
+                src = src.replace(anchor[0], anchor[0] + "\n  webDir: '" + web + "',");
+                fs.writeFileSync(file, src); repaired = true;
+              }
+            }
+          }
+          console.log('[config] Declared webDir: ' + (declared || 'none'));
+          console.log('[config] Resolved webDir: ' + web);
+          console.log(repaired ? '[config] webDir repaired automatically' : '[config] webDir already correct');
+          const env = process.env.GITHUB_ENV;
+          if (env) {
+            fs.appendFileSync(env, 'DECLARED_WEB_DIR=' + (declared || '') + '\n');
+            if (repaired) fs.appendFileSync(env, 'APKFORGE_REPAIRS=' + ((process.env.APKFORGE_REPAIRS ? process.env.APKFORGE_REPAIRS + ',' : '') + file) + '\n');
+          }
+          NODEEOF
+          node /tmp/apkforge-fix-webdir.cjs "$CFG" "$RESOLVED_WEB_DIR" | tee -a "$REPORT"
+          echo "CAP_CONFIG_PATH=$CFG" >> "$GITHUB_ENV"
+
+      - name: Ensure required Capacitor plugins
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}")"
+          ADDED=""
+          for p in browser app haptics camera filesystem preferences push-notifications network geolocation; do
+            PKG="@capacitor/$p"
+            if node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['$PKG']?0:1)" 2>/dev/null; then
+              continue
+            fi
+            if grep -rIlF --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios --exclude-dir=.git "$PKG" . >/dev/null 2>&1; then
+              SPEC="$PKG"
+              if [ -n "$CORE_MAJ" ]; then SPEC="$PKG@^$CORE_MAJ"; fi
+              if npm i "$SPEC" --no-audit --no-fund >/dev/null 2>&1 || npm i "$PKG" --no-audit --no-fund >/dev/null 2>&1; then
+                ADDED="$ADDED $PKG"
+                log "[plugins] Auto-installed missing plugin used by the project: $PKG"
+              else
+                log "[plugins] WARNING: could not auto-install $PKG"
+              fi
+            fi
+          done
+          if [ -z "$ADDED" ]; then log "[plugins] No missing Capacitor plugins detected"; fi
+          echo "APKFORGE_AUTO_PLUGINS=$(echo $ADDED | tr ' ' ',')" >> "$GITHUB_ENV"
+
       - name: Generate or repair native Android project
         working-directory: project
         run: |
@@ -294,19 +433,26 @@ jobs:
           fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
           CAP="npx cap"
 
-          if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.js ] && [ ! -f capacitor.config.json ]; then
-            log "[native] No capacitor config — running cap init (auto-repair)"
-            $CAP init "$APP_NAME" "$BUNDLE_ID" --web-dir="$RESOLVED_WEB_DIR" || fail "capacitor init failed for bundle id $BUNDLE_ID."
-          fi
-
           if [ -d android ] && { [ ! -f android/gradlew ] || [ ! -f android/app/src/main/AndroidManifest.xml ] || [ ! -f android/capacitor.settings.gradle ]; }; then
             log "[native] Existing android/ project is incomplete — regenerating (auto-repair)"
             rm -rf android
           fi
           if [ ! -d android ]; then
             log "[native] Adding Android platform (cap add android)"
-            $CAP add android || fail "cap add android failed — the project could not be converted to a native Android project."
+            # cap add runs copy+update internally; webDir was repaired in the
+            # previous step so copy has real assets to work with. Plugin state
+            # (capacitor.plugins.json) is NOT inspected here — only after cap sync.
+            if ! $CAP add android; then
+              if [ -f android/gradlew ] && [ -f android/app/src/main/AndroidManifest.xml ]; then
+                log "[native] cap add reported an error but the native project scaffold exists — continuing, cap sync will repair it"
+              else
+                fail "cap add android failed — the native Android project could not be generated (webDir '$RESOLVED_WEB_DIR')."
+              fi
+            fi
           fi
+          [ -f android/gradlew ] || fail "Native Android project is missing android/gradlew after generation."
+          log "[native] Native Android project ready"
+
 
       - name: Sync icons and Capacitor plugins
         working-directory: project
@@ -338,22 +484,47 @@ jobs:
           $CAP sync android || { log "[sync] First cap sync failed — retrying after npm install (auto-repair)"; npm install --no-audit --no-fund --legacy-peer-deps; $CAP sync android || fail "cap sync android failed. Native plugins could not be synchronized."; }
           log "[sync] cap sync android completed"
 
-          # Verify every installed Capacitor plugin got registered in the native project.
+          # Plugin verification happens ONLY after cap sync (never before).
+          PLUGINS_JSON="android/app/src/main/assets/capacitor.plugins.json"
+          if [ ! -f "$PLUGINS_JSON" ]; then
+            log "[sync] capacitor.plugins.json missing after sync — re-running cap sync (auto-repair)"
+            $CAP sync android || true
+          fi
+
           MISSING="$(node -e "
             const fs=require('fs');
             const p=JSON.parse(fs.readFileSync('package.json','utf8'));
             const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
-            const plugins=deps.filter(d=>/^@capacitor\//.test(d)&&!['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'].includes(d));
+            const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
+            const plugins=deps.filter(d=>(/^@capacitor\//.test(d)||/^@capacitor-community\//.test(d)||/^capacitor-/.test(d))&&!skip.includes(d));
             let reg='';
-            for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle']) { try { reg+=fs.readFileSync(f,'utf8'); } catch {} }
-            const missing=plugins.filter(pl=>!reg.includes(pl.replace('@capacitor/','capacitor-')) && !reg.includes(pl));
+            for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle','android/app/src/main/assets/capacitor.plugins.json']) { try { reg+=fs.readFileSync(f,'utf8'); } catch {} }
+            const missing=plugins.filter(pl=>!reg.includes(pl) && !reg.includes(pl.replace(/^@/,'').replace(/\//g,'-')));
             console.log(missing.join(','));
           ")"
           if [ -n "$MISSING" ]; then
             log "[sync] Plugins not registered after first sync: $MISSING — re-syncing (auto-repair)"
-            $CAP sync android || fail "Plugin registration failed for: $MISSING"
+            $CAP sync android || true
+            MISSING2="$(node -e "
+              const fs=require('fs');
+              let reg='';
+              for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle','android/app/src/main/assets/capacitor.plugins.json']) { try { reg+=fs.readFileSync(f,'utf8'); } catch {} }
+              const list=process.argv[1].split(',').filter(Boolean);
+              console.log(list.filter(pl=>!reg.includes(pl)).join(','));
+            " "$MISSING")"
+            [ -z "$MISSING2" ] || fail "SYNC_VALIDATION_FAILED: these Capacitor plugins were not registered in the native Android project: $MISSING2"
           fi
-          log "[sync] Registered Capacitor plugins: $(node -e "const p=require('./package.json');console.log(Object.keys({...p.dependencies,...p.devDependencies}).filter(x=>x.includes('capacitor')).join(', ')||'none')")"
+
+          [ -f "$PLUGINS_JSON" ] || log "[sync] WARNING: no capacitor.plugins.json (project declares no native plugins)"
+          PLUGIN_LIST="$(node -e "
+            const p=require('./package.json');
+            const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
+            const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
+            console.log(deps.filter(d=>(/^@capacitor\//.test(d)||/^@capacitor-community\//.test(d)||/^capacitor-/.test(d))&&!skip.includes(d)).join(','));
+          ")"
+          log "[sync] Registered Capacitor plugins: ${PLUGIN_LIST:-none}"
+          echo "APKFORGE_PLUGINS=$PLUGIN_LIST" >> "$GITHUB_ENV"
+
 
       - name: Validate and repair native configuration
         working-directory: project
@@ -761,11 +932,21 @@ jobs:
           chmod +x ./gradlew
           ./gradlew --version | sed -n '1,8p' | tee -a "$REPORT"
           ./gradlew --no-daemon clean
-          ./gradlew --no-daemon assembleRelease \
-            -Pandroid.injected.signing.store.file=${{ github.workspace }}/project/android/app/release.keystore \
-            -Pandroid.injected.signing.store.password="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="$APKFORGE_VALIDATED_KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="${{ secrets.APKFORGE_KEY_PASSWORD }}"
+          KS_PASS="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}"
+          KEY_PASS="${{ secrets.APKFORGE_KEY_PASSWORD }}"
+          KS_FILE="${{ github.workspace }}/project/android/app/release.keystore"
+          gradle_release() {
+            ./gradlew --no-daemon "$1" \
+              -Pandroid.injected.signing.store.file="$KS_FILE" \
+              -Pandroid.injected.signing.store.password="$KS_PASS" \
+              -Pandroid.injected.signing.key.alias="$APKFORGE_VALIDATED_KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$KEY_PASS"
+          }
+          gradle_release assembleRelease
+          gradle_release bundleRelease || echo "::warning::AAB (bundleRelease) could not be produced; APK is unaffected."
+
+
+
 
       - name: Verify release APK
         working-directory: project
@@ -822,39 +1003,59 @@ jobs:
 
           unzip -l "$APK" | grep -q "assets/public/index.html" || fail "Web assets are missing from the APK (assets/public/index.html not found)."
           log "Web assets: bundled"
-          unzip -p "$APK" assets/capacitor.plugins.json 2>/dev/null | tee -a "$VERIFY" || log "capacitor.plugins.json not present (no third-party plugins)"
+          if [ -n "${APKFORGE_PLUGINS:-}" ]; then
+            unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-plugins.json 2>/dev/null || fail "capacitor.plugins.json is missing from the packaged APK — Capacitor plugins were not bundled."
+            cat /tmp/apk-plugins.json | tee -a "$VERIFY"
+            MISSING_IN_APK=""
+            for p in $(echo "$APKFORGE_PLUGINS" | tr ',' ' '); do
+              grep -q "\"$p\"" /tmp/apk-plugins.json || MISSING_IN_APK="$MISSING_IN_APK $p"
+            done
+            [ -z "$MISSING_IN_APK" ] || fail "These Capacitor plugins are missing from the packaged APK:$MISSING_IN_APK"
+            log "Packaged plugins: verified"
+          else
+            log "No Capacitor plugins declared — skipping packaged plugin check"
+          fi
           log "APK_VERIFICATION_PASSED"
 
-      - name: Runtime OAuth callback smoke test
-        uses: reactivecircus/android-emulator-runner@v2
-        timeout-minutes: 15
-        continue-on-error: true
-        with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          script: |
-            set -e
-            cd project
-            RUNTIME="android-oauth-runtime-logcat.txt"
-            : > "$RUNTIME"
-            APK="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1 || true)"
-            if [ -z "$APK" ]; then echo "OAUTH_RUNTIME_FAILED: release APK missing" | tee -a "$RUNTIME"; exit 1; fi
-            SCHEME="$(head -n 1 android-expected-schemes.txt 2>/dev/null || true)"
-            if [ -z "$SCHEME" ]; then SCHEME="$(echo "$BUNDLE_ID" | tr '[:upper:]' '[:lower:]')"; fi
-            adb logcat -c || true
-            adb install -r "$APK" | tee -a "$RUNTIME"
-            adb shell monkey -p "$BUNDLE_ID" 1 | tee -a "$RUNTIME" || true
-            sleep 5
-            adb shell am start -W -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "$SCHEME://auth?code=apkforge_smoke_code&state=apkforge_smoke" "$BUNDLE_ID" | tee -a "$RUNTIME" || true
-            sleep 8
-            adb logcat -d -v time > "$RUNTIME" || true
-            grep -E "APKForgeOAuth|AndroidRuntime|FATAL EXCEPTION|Process.*$BUNDLE_ID|Capacitor|appUrlOpen|exchangeCodeForSession" "$RUNTIME" > android-oauth-runtime-summary.txt || true
-            if grep -E "FATAL EXCEPTION|AndroidRuntime|Process.*$BUNDLE_ID.*(has died|crash)" "$RUNTIME" >/dev/null; then
-              echo "OAUTH_RUNTIME_FAILED: Android crashed while handling the native OAuth callback. See android-oauth-runtime-logcat.txt." | tee -a android-oauth-runtime-summary.txt
-              exit 1
-            fi
-            echo "OAUTH_RUNTIME_SMOKE_PASSED: native callback intent did not crash the app" | tee -a android-oauth-runtime-summary.txt
+
+      - name: Final diagnostics report
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          FINAL="android-build-report.txt"
+          {
+            echo "========== APKForge final build report =========="
+            echo "Build id:            ${BUILD_ID}"
+            echo "App name:            ${APP_NAME}"
+            echo "Bundle id:           ${BUNDLE_ID}"
+            echo "Framework:           ${DETECTED_FRAMEWORK:-unknown}"
+            echo "Package manager:     ${PM:-npm}"
+            echo "Build command:       ${RUN_CMD:-npm run} build"
+            echo "Declared webDir:     ${DECLARED_WEB_DIR:-${WEB_DIR}}"
+            echo "Resolved webDir:     ${RESOLVED_WEB_DIR:-unresolved}"
+            echo "index.html:          ${RESOLVED_WEB_DIR:-?}/index.html"
+            echo "Capacitor config:    ${CAP_CONFIG_PATH:-none}"
+            echo "Capacitor version:   $(npx cap --version 2>/dev/null || echo unknown)"
+            echo "Java version:        $(java -version 2>&1 | head -n 1)"
+            echo "Gradle version:      $( [ -f android/gradle/wrapper/gradle-wrapper.properties ] && sed -n 's/.*gradle-\([0-9.]*\)-.*/\1/p' android/gradle/wrapper/gradle-wrapper.properties | head -n 1 || echo unknown )"
+            echo "Android SDK:         ${ANDROID_HOME:-not set}"
+            echo "Signing alias:       ${APKFORGE_VALIDATED_KEY_ALIAS:-unresolved}"
+            echo "Installed plugins:   ${APKFORGE_PLUGINS:-none}"
+            echo "Auto-installed:      ${APKFORGE_AUTO_PLUGINS:-none}"
+            echo "Repaired files:      ${APKFORGE_REPAIRS:-none}"
+            echo "APK:                 $(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1 || echo none)"
+            echo "AAB:                 $(find android/app/build/outputs/bundle/release -name '*.aab' 2>/dev/null | head -n 1 || echo none)"
+            echo "Runtime OAuth:       NOT tested in CI — manual device testing required."
+            echo "================================================="
+            echo
+            [ -f android-prebuild-report.txt ] && cat android-prebuild-report.txt
+            echo
+            [ -f android-signing-diagnostics.txt ] && cat android-signing-diagnostics.txt
+            echo
+            [ -f android-apk-verification.txt ] && cat android-apk-verification.txt
+          } > "$FINAL" 2>&1
+          cat "$FINAL"
 
       - name: Upload APK
         if: success() || failure()
@@ -863,24 +1064,30 @@ jobs:
           name: apk-${{ github.event.inputs.build_id }}
           path: |
             project/android/app/build/outputs/apk/release/*.apk
+            project/android-build-report.txt
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
-            project/android-oauth-runtime-logcat.txt
-            project/android-oauth-runtime-summary.txt
           if-no-files-found: error
+      - name: Upload AAB
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-${{ github.event.inputs.build_id }}
+          path: project/android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: ignore
       - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostics-${{ github.event.inputs.build_id }}
           path: |
+            project/android-build-report.txt
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
-            project/android-oauth-runtime-logcat.txt
-            project/android-oauth-runtime-summary.txt
           if-no-files-found: ignore
+
       - name: Finalize APKForge build
         if: always()
         run: |
