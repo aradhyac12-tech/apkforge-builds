@@ -162,6 +162,128 @@ jobs:
           npm i @capacitor/android >/dev/null 2>&1 || npm i @capacitor/android || fail "Could not install @capacitor/android."
           log "[capacitor] Version: $(npx cap --version 2>/dev/null || echo unknown)"
 
+      - name: Verify dependencies and toolchain
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          log "== Dependency verification =="
+
+          missing_list() {
+            node -e "
+              const fs=require('fs');
+              const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+              const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
+              const missing=deps.filter(function(d){ try { fs.accessSync('node_modules/'+d+'/package.json'); return false; } catch (e) { return true; } });
+              console.log(missing.join(' '));
+            " 2>/dev/null
+          }
+
+          MISSING="$(missing_list)"
+          if [ -n "$MISSING" ]; then
+            log "[deps] Missing from node_modules:$MISSING"
+            log "[deps] Repair attempt 1 — installing the missing packages with ${PM:-npm}"
+            case "${PM:-npm}" in
+              bun) bun add $MISSING || true ;;
+              pnpm) pnpm add $MISSING || true ;;
+              yarn) yarn add $MISSING || true ;;
+              *) npm i $MISSING --no-audit --no-fund || true ;;
+            esac
+            MISSING="$(missing_list)"
+          fi
+          if [ -n "$MISSING" ]; then
+            log "[deps] Repair attempt 2 — full reinstall with npm --legacy-peer-deps"
+            npm install --no-audit --no-fund --legacy-peer-deps || true
+            MISSING="$(missing_list)"
+          fi
+          [ -z "$MISSING" ] || fail "These declared packages are still not installed after two repair attempts:$MISSING"
+          log "[deps] All declared dependencies and devDependencies resolve inside node_modules"
+
+          # Health check (missing / invalid / duplicated / peer-incompatible).
+          case "${PM:-npm}" in
+            bun) bun pm ls > /tmp/dep-health.txt 2>&1 || true ;;
+            pnpm) pnpm list --depth 1 > /tmp/dep-health.txt 2>&1 || true ;;
+            yarn) yarn list --depth=1 > /tmp/dep-health.txt 2>&1 || true ;;
+            *) npm ls --all --json > /tmp/dep-health.json 2>/dev/null || true ;;
+          esac
+          if [ -s /tmp/dep-health.json ]; then
+            node -e "
+              const fs=require('fs');
+              let tree; try { tree=JSON.parse(fs.readFileSync('/tmp/dep-health.json','utf8')); } catch (e) { console.log('[deps] health: npm ls output unparsable'); process.exit(0); }
+              const problems=[]; const versions={};
+              (function walk(node, path){
+                const deps=node.dependencies||{};
+                for (const name of Object.keys(deps)) {
+                  const d=deps[name]; const here=path+' > '+name;
+                  if (d.missing) problems.push('MISSING '+here);
+                  if (d.invalid) problems.push('INVALID '+here+' ('+(d.invalid===true?'version conflict':d.invalid)+')');
+                  for (const pr of (d.problems||[])) problems.push('PROBLEM '+here+': '+String(pr).slice(0,160));
+                  if (d.version) { versions[name]=versions[name]||new Set(); versions[name].add(d.version); }
+                  walk(d, here);
+                }
+              })(tree, 'root');
+              const dups=Object.keys(versions).filter(function(k){return versions[k].size>1;});
+              console.log('[deps] health problems: '+(problems.length||'none'));
+              problems.slice(0,40).forEach(function(p){ console.log('  '+p); });
+              console.log('[deps] duplicated packages (multiple versions): '+(dups.length?dups.slice(0,25).join(', '):'none'));
+            " | tee -a "$REPORT"
+          elif [ -f /tmp/dep-health.txt ]; then
+            head -n 40 /tmp/dep-health.txt | tee -a "$REPORT"
+          fi
+
+          # Capacitor package presence + major-version compatibility.
+          node -e "
+            const fs=require('fs');
+            const read=function(p){ try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch (e) { return null; } };
+            const pkg=read('package.json')||{};
+            const deps={...(pkg.dependencies||{}),...(pkg.devDependencies||{})};
+            const req=['@capacitor/core','@capacitor/cli','@capacitor/android'];
+            const out=[]; const errs=[]; const majors={};
+            for (const r of req) {
+              const m=read('node_modules/'+r+'/package.json');
+              if (!m) { errs.push(r+' is not installed'); continue; }
+              majors[r]=String(m.version).split('.')[0];
+              out.push(r+'@'+m.version);
+            }
+            const uniq=[...new Set(Object.values(majors))];
+            if (uniq.length>1) errs.push('Capacitor major version mismatch: '+JSON.stringify(majors));
+            const coreMaj=majors['@capacitor/core'];
+            const names=Object.keys(deps).filter(function(d){ return /^(@capacitor\/|@capacitor-community\/|capacitor-)/.test(d) && req.indexOf(d)<0 && d!=='@capacitor/assets'; });
+            for (const n of names) {
+              const m=read('node_modules/'+n+'/package.json');
+              if (!m) { errs.push('plugin '+n+' is declared but not installed'); continue; }
+              out.push(n+'@'+m.version);
+              const peer=(m.peerDependencies||{})['@capacitor/core'];
+              if (peer && coreMaj && peer.indexOf('*')<0 && !new RegExp('(^|[^0-9])'+coreMaj+'\\.').test(peer)) {
+                errs.push('plugin '+n+' expects @capacitor/core '+peer+' but core is '+majors['@capacitor/core']);
+              }
+            }
+            console.log('[deps] Capacitor packages: '+(out.join(', ')||'none'));
+            if (errs.length) console.log('CAP_COMPAT_ERRORS:'+errs.join(' | '));
+          " > /tmp/cap-compat.txt 2>&1 || true
+          cat /tmp/cap-compat.txt | tee -a "$REPORT"
+          if grep -q "CAP_COMPAT_ERRORS:" /tmp/cap-compat.txt; then
+            fail "$(sed -n 's/^CAP_COMPAT_ERRORS://p' /tmp/cap-compat.txt | head -n 1)"
+          fi
+
+          # Toolchain: Java, Android SDK, build-tools, licences.
+          JAVA_MAJ="$(java -version 2>&1 | head -n 1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p')"
+          log "[toolchain] Java major: ${JAVA_MAJ:-unknown}"
+          if [ -n "$JAVA_MAJ" ] && [ "$JAVA_MAJ" -lt 17 ]; then
+            fail "Java 17 or newer is required for the Android build (found $JAVA_MAJ)."
+          fi
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          [ -d "$SDK" ] || fail "Android SDK not found (ANDROID_HOME=${ANDROID_HOME:-unset})."
+          [ -d "$SDK/platform-tools" ] || fail "Android SDK platform-tools are missing at $SDK/platform-tools."
+          BT="$(ls -d $SDK/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          [ -n "$BT" ] || fail "No Android build-tools are installed under $SDK/build-tools."
+          log "[toolchain] Android SDK: $SDK (build-tools $(basename "$BT"))"
+          log "[toolchain] Accepted licence files: $(ls "$SDK/licenses" 2>/dev/null | wc -l)"
+          log "[deps] Dependency and toolchain verification passed"
+
+
+
       - name: Build web assets
         working-directory: project
         run: |
@@ -481,8 +603,26 @@ jobs:
             log "[icon] No icon supplied or detected — using Capacitor default"
           fi
 
-          $CAP sync android || { log "[sync] First cap sync failed — retrying after npm install (auto-repair)"; npm install --no-audit --no-fund --legacy-peer-deps; $CAP sync android || fail "cap sync android failed. Native plugins could not be synchronized."; }
+          # cap sync output is captured verbatim so the Browser plugin trace can
+          # prove whether sync actually registered the native plugins.
+          if $CAP sync android > /tmp/cap-sync.log 2>&1; then
+            cat /tmp/cap-sync.log | tee -a "$REPORT"
+            echo "CAP_SYNC_EXIT=0" >> "$GITHUB_ENV"
+          else
+            cat /tmp/cap-sync.log | tee -a "$REPORT"
+            log "[sync] First cap sync failed — retrying after npm install (auto-repair)"
+            npm install --no-audit --no-fund --legacy-peer-deps
+            if $CAP sync android > /tmp/cap-sync-retry.log 2>&1; then
+              cat /tmp/cap-sync-retry.log | tee -a "$REPORT"
+              echo "CAP_SYNC_EXIT=0-after-retry" >> "$GITHUB_ENV"
+            else
+              cat /tmp/cap-sync-retry.log | tee -a "$REPORT"
+              echo "CAP_SYNC_EXIT=failed" >> "$GITHUB_ENV"
+              fail "cap sync android failed. Native plugins could not be synchronized."
+            fi
+          fi
           log "[sync] cap sync android completed"
+
 
           # Plugin verification happens ONLY after cap sync (never before).
           PLUGINS_JSON="android/app/src/main/assets/capacitor.plugins.json"
@@ -524,6 +664,190 @@ jobs:
           ")"
           log "[sync] Registered Capacitor plugins: ${PLUGIN_LIST:-none}"
           echo "APKFORGE_PLUGINS=$PLUGIN_LIST" >> "$GITHUB_ENV"
+
+      - name: Browser plugin forensic trace (post-sync)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          cat > /tmp/apkforge-browser-trace.sh <<'TRACEEOF'
+          #!/usr/bin/env bash
+          # Evidence-only forensic trace of @capacitor/browser through the pipeline.
+          # This script never repairs anything: it only records what exists where.
+          PHASE="$1"
+          TRACE="browser-plugin-trace.txt"
+          out() { echo "$1" | tee -a "$TRACE"; }
+          VERDICT=""
+          note() { [ -n "$VERDICT" ] || VERDICT="$1"; }
+
+          out "========== Browser plugin trace ($PHASE) =========="
+          out "cwd: $(pwd)"
+
+          if [ "$PHASE" != "post-apk" ]; then
+            # 1. Declaration in package.json
+            DECL="$(node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log(d['@capacitor/browser']||'')" 2>/dev/null)"
+            if [ -n "$DECL" ]; then
+              out "1 PASS  package.json declares @capacitor/browser@$DECL"
+            else
+              out "1 FAIL  project/package.json does not declare @capacitor/browser"
+              node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log('      capacitor-ish deps present: '+(Object.keys(d).filter(function(k){return /capacitor/.test(k);}).join(', ')||'none'))" 2>/dev/null | tee -a "$TRACE"
+              note "stage 1 — @capacitor/browser is not declared in project/package.json, so nothing downstream can install or register it"
+            fi
+
+            # 2. Installed in node_modules
+            if [ -f node_modules/@capacitor/browser/package.json ]; then
+              out "2 PASS  node_modules/@capacitor/browser present, version $(node -p "require('./node_modules/@capacitor/browser/package.json').version" 2>/dev/null)"
+            else
+              out "2 FAIL  node_modules/@capacitor/browser/package.json does not exist"
+              note "stage 2 — @capacitor/browser is not installed in node_modules"
+            fi
+
+            # 3. Native Android sources shipped by the plugin
+            if [ -d node_modules/@capacitor/browser/android ]; then
+              out "3 PASS  node_modules/@capacitor/browser/android exists"
+              find node_modules/@capacitor/browser/android -name 'BrowserPlugin.java' 2>/dev/null | sed 's/^/      /' | tee -a "$TRACE"
+            else
+              out "3 FAIL  node_modules/@capacitor/browser/android is missing (no native code for cap sync to register)"
+              note "stage 3 — the installed @capacitor/browser package ships no android/ native sources"
+            fi
+
+            # 4. cap sync evidence
+            if [ -f /tmp/cap-sync.log ] || [ -f /tmp/cap-sync-retry.log ]; then
+              out "4 INFO  cap sync exit marker: ${CAP_SYNC_EXIT:-unknown}"
+              out "4 ----- cap sync output (verbatim) -----"
+              cat /tmp/cap-sync.log /tmp/cap-sync-retry.log 2>/dev/null | sed 's/^/      /' | tee -a "$TRACE"
+              if cat /tmp/cap-sync.log /tmp/cap-sync-retry.log 2>/dev/null | grep -qi "@capacitor/browser"; then
+                out "4 PASS  cap sync output mentions @capacitor/browser"
+              else
+                out "4 FAIL  cap sync output never mentions @capacitor/browser"
+                note "stage 4 — cap sync did not see @capacitor/browser as an installed plugin"
+              fi
+            else
+              out "4 SKIP  no cap sync log captured"
+            fi
+
+            # 5/6. capacitor.plugins.json
+            PJ="android/app/src/main/assets/capacitor.plugins.json"
+            if [ -f "$PJ" ]; then
+              out "5 PASS  $PJ exists:"
+              sed 's/^/      /' "$PJ" | tee -a "$TRACE"
+              if grep -q "BrowserPlugin" "$PJ"; then
+                out "6 PASS  $PJ registers com.capacitorjs.plugins.browser.BrowserPlugin"
+              else
+                out "6 FAIL  $PJ contains no BrowserPlugin entry"
+                note "stage 6 — capacitor.plugins.json exists but has no Browser entry"
+              fi
+            else
+              out "5 FAIL  $PJ does not exist after cap sync"
+              note "stage 5 — capacitor.plugins.json was not generated by cap sync"
+            fi
+
+            # 7. Gradle registration
+            out "7 ----- Gradle plugin registration -----"
+            for f in android/capacitor.settings.gradle android/app/capacitor.build.gradle; do
+              if [ -f "$f" ]; then
+                HIT="$(grep -n -i "capacitor-browser" "$f")"
+                if [ -n "$HIT" ]; then
+                  out "7 PASS  $f:"; echo "$HIT" | sed 's/^/      /' | tee -a "$TRACE"
+                else
+                  out "7 FAIL  $f has no capacitor-browser entry"
+                  note "stage 7 — $f does not include the capacitor-browser Gradle module"
+                fi
+              else
+                out "7 FAIL  $f is missing"
+                note "stage 7 — $f is missing from the native project"
+              fi
+            done
+
+            # 8. MainActivity
+            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            if [ -n "$MA" ]; then
+              out "8 ----- $MA (full contents) -----"
+              sed 's/^/      /' "$MA" | tee -a "$TRACE"
+              if grep -q "extends BridgeActivity" "$MA"; then
+                out "8 PASS  MainActivity extends BridgeActivity (auto-registration path intact)"
+              else
+                out "8 FAIL  MainActivity does not extend BridgeActivity"
+                note "stage 8 — MainActivity at $MA does not extend BridgeActivity, so plugins are never auto-registered"
+              fi
+              if grep -q "registerPlugin" "$MA"; then
+                out "8 WARN  MainActivity calls registerPlugin explicitly — an explicit list replaces auto-registration:"
+                grep -n "registerPlugin" "$MA" | sed 's/^/      /' | tee -a "$TRACE"
+                grep -q "BrowserPlugin" "$MA" || note "stage 8 — MainActivity registers an explicit plugin list that omits BrowserPlugin"
+              else
+                out "8 PASS  MainActivity uses Capacitor auto-registration (no explicit registerPlugin list)"
+              fi
+              if grep -q "ApkforgeOAuthDiagnostics" "$MA"; then
+                out "8 INFO  APKForge diagnostics injection is present in MainActivity (class declaration unchanged: $(grep -c 'extends BridgeActivity' "$MA") BridgeActivity declaration(s))"
+              else
+                out "8 INFO  No APKForge diagnostics injection in MainActivity"
+              fi
+            else
+              out "8 FAIL  MainActivity.java not found under android/app/src/main/java"
+              note "stage 8 — MainActivity.java is missing from the native project"
+            fi
+          fi
+
+          if [ "$PHASE" = "post-apk" ]; then
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1)"
+            if [ -z "$APK" ]; then
+              out "9 FAIL  no release APK found under android/app/build/outputs/apk/release"
+              note "stage 9 — no release APK was produced"
+            else
+              out "9 ----- APK assets ($APK) -----"
+              unzip -l "$APK" | grep -E "assets/(capacitor|public/index)" | sed 's/^/      /' | tee -a "$TRACE"
+              if unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-browser-plugins.json 2>/dev/null; then
+                out "9 PASS  assets/capacitor.plugins.json is packaged:"
+                sed 's/^/      /' /tmp/apk-browser-plugins.json | tee -a "$TRACE"
+                if grep -q "BrowserPlugin" /tmp/apk-browser-plugins.json; then
+                  out "9 PASS  packaged capacitor.plugins.json contains BrowserPlugin"
+                else
+                  out "9 FAIL  packaged capacitor.plugins.json has no BrowserPlugin entry"
+                  note "stage 9 — the packaged APK's capacitor.plugins.json omits Browser"
+                fi
+              else
+                out "9 FAIL  assets/capacitor.plugins.json is not inside the APK"
+                note "stage 9 — capacitor.plugins.json was not packaged into the APK"
+              fi
+
+              # 10. Native classes inside the dex
+              FOUND_CLASS=""
+              for DEX in $(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null); do
+                unzip -p "$APK" "$DEX" > /tmp/apkforge.dex 2>/dev/null || continue
+                if strings /tmp/apkforge.dex 2>/dev/null | grep -q "capacitorjs/plugins/browser/BrowserPlugin"; then
+                  FOUND_CLASS="$DEX"; break
+                fi
+              done
+              if [ -n "$FOUND_CLASS" ]; then
+                out "10 PASS  BrowserPlugin native class found in $FOUND_CLASS"
+              else
+                out "10 FAIL  BrowserPlugin native class is not present in any classes*.dex of the APK"
+                note "stage 10 — the Browser native class was never compiled into the APK"
+              fi
+
+              # 11. Artifact identity
+              out "11 ----- artifact identity -----"
+              out "      path:      $APK"
+              out "      sha256:    $(sha256sum "$APK" | cut -d' ' -f1)"
+              out "      size:      $(wc -c < "$APK") bytes"
+              out "      built at:  $(date -u -r "$APK" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+              out "      build_id:  ${BUILD_ID:-unknown}"
+              out "      run:       ${GITHUB_REPOSITORY:-?}/actions/runs/${GITHUB_RUN_ID:-?}"
+              out "      Compare this sha256 with the installed APK to confirm the device runs this artifact."
+            fi
+          fi
+
+          if [ -n "$VERDICT" ]; then
+            out "BROWSER_TRACE_VERDICT: $VERDICT"
+          else
+            out "BROWSER_TRACE_VERDICT: present end-to-end ($PHASE)"
+          fi
+          out "========== end Browser plugin trace ($PHASE) =========="
+          TRACEEOF
+          chmod +x /tmp/apkforge-browser-trace.sh
+          bash /tmp/apkforge-browser-trace.sh post-sync
+          exit 0
+
 
 
       - name: Validate and repair native configuration
@@ -929,8 +1253,13 @@ jobs:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
         run: |
           set -e
+          # Gradle wrapper preflight (toolchain verification, part 2).
+          [ -f ./gradlew ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradlew is missing from the generated native project." | tee -a "$REPORT"; exit 1; }
+          [ -f gradle/wrapper/gradle-wrapper.properties ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradle/wrapper/gradle-wrapper.properties is missing, so no Gradle version is declared." | tee -a "$REPORT"; exit 1; }
+          grep -n "distributionUrl" gradle/wrapper/gradle-wrapper.properties | tee -a "$REPORT"
           chmod +x ./gradlew
           ./gradlew --version | sed -n '1,8p' | tee -a "$REPORT"
+
           ./gradlew --no-daemon clean
           KS_PASS="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}"
           KEY_PASS="${{ secrets.APKFORGE_KEY_PASSWORD }}"
@@ -1017,6 +1346,20 @@ jobs:
           fi
           log "APK_VERIFICATION_PASSED"
 
+      - name: Browser plugin forensic trace (post-APK)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          if [ -f /tmp/apkforge-browser-trace.sh ]; then
+            bash /tmp/apkforge-browser-trace.sh post-apk
+          else
+            echo "Browser plugin trace script unavailable (pipeline failed before sync)."
+          fi
+          exit 0
+
+
+
 
       - name: Final diagnostics report
         if: success() || failure()
@@ -1054,6 +1397,9 @@ jobs:
             [ -f android-signing-diagnostics.txt ] && cat android-signing-diagnostics.txt
             echo
             [ -f android-apk-verification.txt ] && cat android-apk-verification.txt
+            echo
+            [ -f browser-plugin-trace.txt ] && cat browser-plugin-trace.txt
+
           } > "$FINAL" 2>&1
           cat "$FINAL"
 
@@ -1068,6 +1414,7 @@ jobs:
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
+            project/browser-plugin-trace.txt
           if-no-files-found: error
       - name: Upload AAB
         if: success() || failure()
@@ -1086,6 +1433,7 @@ jobs:
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
+            project/browser-plugin-trace.txt
           if-no-files-found: ignore
 
       - name: Finalize APKForge build
