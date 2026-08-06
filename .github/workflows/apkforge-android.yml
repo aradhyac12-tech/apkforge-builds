@@ -170,34 +170,68 @@ jobs:
           fail() { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
           log "== Dependency verification =="
 
+          # --- Lockfile / package manager evidence -------------------------
+          LOCK="none"
+          if [ -f package-lock.json ]; then LOCK="package-lock.json"; fi
+          if [ -f yarn.lock ]; then LOCK="yarn.lock"; fi
+          if [ -f pnpm-lock.yaml ]; then LOCK="pnpm-lock.yaml"; fi
+          if [ -f bun.lockb ] || [ -f bun.lock ]; then LOCK="bun.lock"; fi
+          PM_FIELD="$(node -e "try{console.log(require('./package.json').packageManager||'')}catch(e){console.log('')}" 2>/dev/null)"
+          log "[deps] Package manager: ${PM:-npm} (lockfile: $LOCK${PM_FIELD:+, packageManager: $PM_FIELD})"
+          if [ "$LOCK" = "none" ]; then log "[deps] No lockfile present — resolving from package.json ranges"; fi
+
           missing_list() {
             node -e "
               const fs=require('fs');
               const p=JSON.parse(fs.readFileSync('package.json','utf8'));
               const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
-              const missing=deps.filter(function(d){ try { fs.accessSync('node_modules/'+d+'/package.json'); return false; } catch (e) { return true; } });
+              const missing=deps.filter(function(d){
+                try { JSON.parse(fs.readFileSync('node_modules/'+d+'/package.json','utf8')); return false; }
+                catch (e) { return true; }
+              });
               console.log(missing.join(' '));
             " 2>/dev/null
           }
 
+          install_pkgs() {
+            case "${PM:-npm}" in
+              bun) bun add $1 || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
+              pnpm) pnpm add $1 || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
+              yarn) yarn add $1 || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
+              *) npm i $1 --no-audit --no-fund || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
+            esac
+          }
+
+          REPAIRS=""
           MISSING="$(missing_list)"
           if [ -n "$MISSING" ]; then
-            log "[deps] Missing from node_modules:$MISSING"
-            log "[deps] Repair attempt 1 — installing the missing packages with ${PM:-npm}"
-            case "${PM:-npm}" in
-              bun) bun add $MISSING || true ;;
-              pnpm) pnpm add $MISSING || true ;;
-              yarn) yarn add $MISSING || true ;;
-              *) npm i $MISSING --no-audit --no-fund || true ;;
-            esac
+            log "[deps] Missing or unreadable in node_modules:$MISSING"
+            # A package folder that exists but cannot be read is broken — drop it
+            # so the reinstall is clean instead of a no-op.
+            for m in $MISSING; do if [ -d "node_modules/$m" ]; then rm -rf "node_modules/$m"; fi; done
+            log "[deps] Repair 1/3 — installing the missing set with ${PM:-npm}"
+            install_pkgs "$MISSING"
+            REPAIRS="$REPAIRS installed:$(echo $MISSING | tr ' ' ',')"
             MISSING="$(missing_list)"
           fi
           if [ -n "$MISSING" ]; then
-            log "[deps] Repair attempt 2 — full reinstall with npm --legacy-peer-deps"
-            npm install --no-audit --no-fund --legacy-peer-deps || true
+            log "[deps] Repair 2/3 — full reinstall with ${PM:-npm}"
+            case "${PM:-npm}" in
+              bun) bun install || true ;;
+              pnpm) pnpm install --no-frozen-lockfile || true ;;
+              yarn) yarn install || true ;;
+              *) npm install --no-audit --no-fund || true ;;
+            esac
+            REPAIRS="$REPAIRS full-reinstall"
             MISSING="$(missing_list)"
           fi
-          [ -z "$MISSING" ] || fail "These declared packages are still not installed after two repair attempts:$MISSING"
+          if [ -n "$MISSING" ]; then
+            log "[deps] Repair 3/3 — npm install --legacy-peer-deps"
+            npm install --no-audit --no-fund --legacy-peer-deps || true
+            REPAIRS="$REPAIRS legacy-peer-deps"
+            MISSING="$(missing_list)"
+          fi
+          [ -z "$MISSING" ] || fail "These declared packages could not be installed after three repair attempts:$MISSING"
           log "[deps] All declared dependencies and devDependencies resolve inside node_modules"
 
           # Health check (missing / invalid / duplicated / peer-incompatible).
@@ -207,6 +241,7 @@ jobs:
             yarn) yarn list --depth=1 > /tmp/dep-health.txt 2>&1 || true ;;
             *) npm ls --all --json > /tmp/dep-health.json 2>/dev/null || true ;;
           esac
+          DUPES=""
           if [ -s /tmp/dep-health.json ]; then
             node -e "
               const fs=require('fs');
@@ -227,45 +262,111 @@ jobs:
               console.log('[deps] health problems: '+(problems.length||'none'));
               problems.slice(0,40).forEach(function(p){ console.log('  '+p); });
               console.log('[deps] duplicated packages (multiple versions): '+(dups.length?dups.slice(0,25).join(', '):'none'));
-            " | tee -a "$REPORT"
+              if (dups.length) console.log('DEP_DUPES=1');
+            " > /tmp/dep-health-report.txt 2>&1 || true
+            cat /tmp/dep-health-report.txt | grep -v '^DEP_DUPES=' | tee -a "$REPORT"
+            if grep -q '^DEP_DUPES=1' /tmp/dep-health-report.txt; then DUPES=1; fi
           elif [ -f /tmp/dep-health.txt ]; then
             head -n 40 /tmp/dep-health.txt | tee -a "$REPORT"
           fi
-
-          # Capacitor package presence + major-version compatibility.
-          node -e "
-            const fs=require('fs');
-            const read=function(p){ try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch (e) { return null; } };
-            const pkg=read('package.json')||{};
-            const deps={...(pkg.dependencies||{}),...(pkg.devDependencies||{})};
-            const req=['@capacitor/core','@capacitor/cli','@capacitor/android'];
-            const out=[]; const errs=[]; const majors={};
-            for (const r of req) {
-              const m=read('node_modules/'+r+'/package.json');
-              if (!m) { errs.push(r+' is not installed'); continue; }
-              majors[r]=String(m.version).split('.')[0];
-              out.push(r+'@'+m.version);
-            }
-            const uniq=[...new Set(Object.values(majors))];
-            if (uniq.length>1) errs.push('Capacitor major version mismatch: '+JSON.stringify(majors));
-            const coreMaj=majors['@capacitor/core'];
-            const names=Object.keys(deps).filter(function(d){ return /^(@capacitor\/|@capacitor-community\/|capacitor-)/.test(d) && req.indexOf(d)<0 && d!=='@capacitor/assets'; });
-            for (const n of names) {
-              const m=read('node_modules/'+n+'/package.json');
-              if (!m) { errs.push('plugin '+n+' is declared but not installed'); continue; }
-              out.push(n+'@'+m.version);
-              const peer=(m.peerDependencies||{})['@capacitor/core'];
-              if (peer && coreMaj && peer.indexOf('*')<0 && !new RegExp('(^|[^0-9])'+coreMaj+'\\.').test(peer)) {
-                errs.push('plugin '+n+' expects @capacitor/core '+peer+' but core is '+majors['@capacitor/core']);
-              }
-            }
-            console.log('[deps] Capacitor packages: '+(out.join(', ')||'none'));
-            if (errs.length) console.log('CAP_COMPAT_ERRORS:'+errs.join(' | '));
-          " > /tmp/cap-compat.txt 2>&1 || true
-          cat /tmp/cap-compat.txt | tee -a "$REPORT"
-          if grep -q "CAP_COMPAT_ERRORS:" /tmp/cap-compat.txt; then
-            fail "$(sed -n 's/^CAP_COMPAT_ERRORS://p' /tmp/cap-compat.txt | head -n 1)"
+          if [ -n "$DUPES" ]; then
+            log "[deps] Deduplicating (auto-repair)"
+            case "${PM:-npm}" in
+              pnpm) pnpm dedupe >/dev/null 2>&1 || true ;;
+              yarn) yarn dedupe >/dev/null 2>&1 || true ;;
+              bun) : ;;
+              *) npm dedupe --no-audit --no-fund >/dev/null 2>&1 || true ;;
+            esac
+            REPAIRS="$REPAIRS dedupe"
+            MISSING="$(missing_list)"
+            [ -z "$MISSING" ] || install_pkgs "$MISSING"
           fi
+
+          # --- Capacitor compatibility (official rules: MAJOR must match) ---
+          # Minor/patch differences across plugins are always allowed.
+          cap_compat() {
+            node -e "
+              const fs=require('fs');
+              const read=(p)=>{ try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch (e) { return null; } };
+              const pkg=read('package.json')||{};
+              const deps={...(pkg.dependencies||{}),...(pkg.devDependencies||{})};
+              const inst=(n)=>read('node_modules/'+n+'/package.json');
+              const majorOf=(v)=>parseInt(String(v||'').split('.')[0],10);
+              // Real range evaluation — only the MAJOR has to be compatible.
+              const peerOk=(range,coreMaj)=>{
+                if (!range || range.indexOf('*')>=0 || range==='latest') return true;
+                for (const part of String(range).split('||')) {
+                  const comps=part.trim().split(/\s+/).filter(Boolean);
+                  if (!comps.length) continue;
+                  let ok=true;
+                  for (const c of comps) {
+                    const m=c.match(/^(>=|<=|>|<|\^|~|=)?\s*v?(\d+)/);
+                    if (!m) { ok=false; break; }
+                    const op=m[1]||'=';
+                    const maj=parseInt(m[2],10);
+                    if (op==='>='||op==='>') ok=ok&&coreMaj>=maj;
+                    else if (op==='<=') ok=ok&&coreMaj<=maj;
+                    else if (op==='<') ok=ok&&coreMaj<maj;
+                    else ok=ok&&coreMaj===maj;
+                  }
+                  if (ok) return true;
+                }
+                return false;
+              };
+              const core=inst('@capacitor/core');
+              if (!core) { console.log('CAP_ERR:@capacitor/core is not installed'); process.exit(0); }
+              const coreMaj=majorOf(core.version);
+              const inventory=['@capacitor/core@'+core.version];
+              const fixes=[]; const errs=[];
+              for (const n of ['@capacitor/cli','@capacitor/android','@capacitor/ios']) {
+                const m=inst(n);
+                if (!m) {
+                  if (n==='@capacitor/ios') continue;
+                  fixes.push(n+'@^'+coreMaj); errs.push(n+' is not installed'); continue;
+                }
+                inventory.push(n+'@'+m.version);
+                if (majorOf(m.version)!==coreMaj) {
+                  fixes.push(n+'@^'+coreMaj);
+                  errs.push(n+' is v'+m.version+' but @capacitor/core is v'+core.version+' (major must match)');
+                }
+              }
+              const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
+              const pluginNames=Object.keys(deps).filter((d)=>/^(@capacitor\/|@capacitor-community\/|capacitor-)/.test(d)&&skip.indexOf(d)<0);
+              for (const n of pluginNames) {
+                const m=inst(n);
+                if (!m) { fixes.push(n+'@^'+coreMaj); errs.push(n+' is declared but not installed'); continue; }
+                inventory.push(n+'@'+m.version);
+                const peer=(m.peerDependencies||{})['@capacitor/core'];
+                // minor/patch differences are always fine — only a peer major
+                // that excludes the installed core is a real incompatibility.
+                if (peer && !peerOk(peer,coreMaj)) {
+                  fixes.push(n+'@^'+coreMaj);
+                  errs.push(n+'@'+m.version+' expects @capacitor/core '+peer+' but core is v'+core.version);
+                }
+              }
+              console.log('CAP_INV:'+inventory.join(', '));
+              fixes.forEach((f)=>console.log('CAP_FIX:'+f));
+              errs.forEach((e)=>console.log('CAP_ERR:'+e));
+            " > /tmp/cap-compat.txt 2>&1 || true
+          }
+
+          cap_compat
+          sed -n 's/^CAP_INV:/[deps] Capacitor packages: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+          if grep -q '^CAP_FIX:' /tmp/cap-compat.txt; then
+            FIXES="$(sed -n 's/^CAP_FIX://p' /tmp/cap-compat.txt | tr '\n' ' ')"
+            sed -n 's/^CAP_ERR:/[deps] Capacitor incompatibility: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+            log "DEPENDENCY_REPAIRED: realigning Capacitor packages to core major: $FIXES"
+            install_pkgs "$FIXES"
+            REPAIRS="$REPAIRS cap-realign:$(echo $FIXES | tr ' ' ',')"
+            cap_compat
+            sed -n 's/^CAP_INV:/[deps] Capacitor packages after repair: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+          fi
+          if grep -q '^CAP_ERR:' /tmp/cap-compat.txt; then
+            sed -n 's/^CAP_ERR:/[deps] Unresolved: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+            fail "$(sed -n 's/^CAP_ERR://p' /tmp/cap-compat.txt | head -n 1)"
+          fi
+          log "[deps] Capacitor compatibility OK (major versions aligned; minor/patch differences allowed)"
+          if [ -n "$REPAIRS" ]; then log "DEPENDENCY_REPAIRED:$REPAIRS"; fi
 
           # Toolchain: Java, Android SDK, build-tools, licences.
           JAVA_MAJ="$(java -version 2>&1 | head -n 1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p')"
@@ -527,24 +628,72 @@ jobs:
           set -e
           log() { echo "$1" | tee -a "$REPORT"; }
           CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}")"
+
+          # Signals are collected once from the project sources + package.json.
+          # A plugin is required when the source imports it directly OR when a
+          # library/API that needs it natively is present (e.g. an OAuth SDK
+          # cannot return to the app without Browser + App).
+          SRC_HITS=/tmp/plugin-signals.txt
+          : > "$SRC_HITS"
+          grep -rIloE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios --exclude-dir=.git --exclude-dir=dist --exclude-dir=build \
+            "@capacitor/[a-z-]+|@supabase/supabase-js|firebase/auth|@auth0/|@clerk/|appwrite|amazon-cognito|oidc-client|signInWithOAuth|signInWithRedirect|loginWithRedirect|authorize\(|oauth|getUserMedia|navigator\.geolocation|localStorage|serviceWorker|Notification\.requestPermission|<input[^>]+type=[\"']file[\"']|qr|barcode|biometric|webauthn" . 2>/dev/null \
+            | sort -u > "$SRC_HITS" || true
+          DEPS_TXT="$(node -e "const d=require('./package.json');console.log(Object.keys({...(d.dependencies||{}),...(d.devDependencies||{})}).join(' '))" 2>/dev/null || echo '')"
+          sig() { grep -qiE "$1" "$SRC_HITS" 2>/dev/null || echo "$DEPS_TXT" | grep -qiE "$1"; }
+
+          OAUTH_SIGNAL=""
+          if sig "@supabase/supabase-js|firebase|@auth0/|@clerk/|appwrite|cognito|oidc|next-auth|signinwithoauth|signinwithredirect|loginwithredirect|oauth"; then
+            OAUTH_SIGNAL=1
+            log "[plugins] OAuth/auth SDK signal detected — Browser + App are required for native callbacks"
+          fi
+
+          declared() {
+            node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['$1']?0:1)" 2>/dev/null
+          }
+          need() {
+            # need <plugin-suffix> <extra-signal-regex>
+            PKG="@capacitor/$1"
+            declared "$PKG" && return 1
+            grep -qF "$PKG" "$SRC_HITS" 2>/dev/null && return 0
+            sig "$2" && return 0
+            return 1
+          }
+
           ADDED=""
-          for p in browser app haptics camera filesystem preferences push-notifications network geolocation; do
-            PKG="@capacitor/$p"
-            if node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['$PKG']?0:1)" 2>/dev/null; then
-              continue
+          add_plugin() {
+            case " $ADDED " in *" $1 "*) return 0 ;; esac
+            SPEC="$1"
+            if [ -n "$CORE_MAJ" ]; then SPEC="$1@^$CORE_MAJ"; fi
+            if npm i "$SPEC" --no-audit --no-fund >/dev/null 2>&1 || npm i "$1" --no-audit --no-fund >/dev/null 2>&1; then
+              ADDED="$ADDED $1"
+              log "PLUGIN_AUTOINSTALL: $1 (required by detected project capabilities)"
+            else
+              log "[plugins] WARNING: could not auto-install $1"
             fi
-            if grep -rIlF --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios --exclude-dir=.git "$PKG" . >/dev/null 2>&1; then
-              SPEC="$PKG"
-              if [ -n "$CORE_MAJ" ]; then SPEC="$PKG@^$CORE_MAJ"; fi
-              if npm i "$SPEC" --no-audit --no-fund >/dev/null 2>&1 || npm i "$PKG" --no-audit --no-fund >/dev/null 2>&1; then
-                ADDED="$ADDED $PKG"
-                log "[plugins] Auto-installed missing plugin used by the project: $PKG"
-              else
-                log "[plugins] WARNING: could not auto-install $PKG"
-              fi
-            fi
-          done
-          if [ -z "$ADDED" ]; then log "[plugins] No missing Capacitor plugins detected"; fi
+          }
+
+          # app + browser are installed whenever the project has any OAuth signal:
+          # without them the provider callback stays in the system browser.
+          if [ -n "$OAUTH_SIGNAL" ]; then
+            declared "@capacitor/app" || add_plugin "@capacitor/app"
+            declared "@capacitor/browser" || add_plugin "@capacitor/browser"
+          fi
+          # @capacitor/app underpins lifecycle + appUrlOpen deep-link delivery.
+          declared "@capacitor/app" || add_plugin "@capacitor/app"
+
+          if need browser "oauth|signinwithoauth|loginwithredirect|window\.open|opensystembrowser"; then add_plugin "@capacitor/browser"; fi
+          if need camera "getusermedia|<input[^>]+type=.file|qr|barcode|scanner|photo"; then add_plugin "@capacitor/camera"; fi
+          if need geolocation "navigator\.geolocation|geolocation|maps"; then add_plugin "@capacitor/geolocation"; fi
+          if need filesystem "filesystem|downloadfile|writefile|blob|filereader"; then add_plugin "@capacitor/filesystem"; fi
+          if need preferences "localstorage|sessionstorage|persist"; then add_plugin "@capacitor/preferences"; fi
+          if need push-notifications "notification\.requestpermission|firebase/messaging|onesignal|push"; then add_plugin "@capacitor/push-notifications"; fi
+          if need network "navigator\.online|offline|network"; then add_plugin "@capacitor/network"; fi
+          if need haptics "haptic|vibrate"; then add_plugin "@capacitor/haptics"; fi
+          if need status-bar "statusbar|safe-area"; then add_plugin "@capacitor/status-bar"; fi
+          if need splash-screen "splash"; then add_plugin "@capacitor/splash-screen"; fi
+
+          if [ -z "$ADDED" ]; then log "[plugins] No additional Capacitor plugins required"; fi
+          log "[plugins] Auto-installed:${ADDED:- none}"
           echo "APKFORGE_AUTO_PLUGINS=$(echo $ADDED | tr ' ' ',')" >> "$GITHUB_ENV"
 
       - name: Generate or repair native Android project
@@ -631,37 +780,53 @@ jobs:
             $CAP sync android || true
           fi
 
-          MISSING="$(node -e "
+          # The plugin set is "declared in package.json" UNION "installed in
+          # node_modules with an android/ source folder" — a plugin pulled in
+          # transitively is just as native, and must be registered too.
+          PLUGIN_LIST="$(node -e "
             const fs=require('fs');
-            const p=JSON.parse(fs.readFileSync('package.json','utf8'));
-            const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
             const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
-            const plugins=deps.filter(d=>(/^@capacitor\//.test(d)||/^@capacitor-community\//.test(d)||/^capacitor-/.test(d))&&!skip.includes(d));
-            let reg='';
-            for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle','android/app/src/main/assets/capacitor.plugins.json']) { try { reg+=fs.readFileSync(f,'utf8'); } catch {} }
-            const missing=plugins.filter(pl=>!reg.includes(pl) && !reg.includes(pl.replace(/^@/,'').replace(/\//g,'-')));
-            console.log(missing.join(','));
-          ")"
-          if [ -n "$MISSING" ]; then
-            log "[sync] Plugins not registered after first sync: $MISSING — re-syncing (auto-repair)"
-            $CAP sync android || true
-            MISSING2="$(node -e "
+            const isPlugin=(d)=>(/^@capacitor\//.test(d)||/^@capacitor-community\//.test(d)||/^capacitor-/.test(d))&&skip.indexOf(d)<0;
+            const set=new Set();
+            try {
+              const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+              Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})}).filter(isPlugin).forEach((d)=>set.add(d));
+            } catch (e) {}
+            const scan=(dir,prefix)=>{
+              let entries=[];
+              try { entries=fs.readdirSync(dir); } catch (e) { return; }
+              for (const en of entries) {
+                const name=prefix+en;
+                if (!isPlugin(name)) continue;
+                try { fs.statSync(dir+'/'+en+'/android'); set.add(name); } catch (err) {}
+              }
+            };
+            scan('node_modules/@capacitor','@capacitor/');
+            scan('node_modules/@capacitor-community','@capacitor-community/');
+            scan('node_modules','');
+            console.log(Array.from(set).join(','));
+          " 2>/dev/null)"
+          registered_missing() {
+            node -e "
               const fs=require('fs');
               let reg='';
-              for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle','android/app/src/main/assets/capacitor.plugins.json']) { try { reg+=fs.readFileSync(f,'utf8'); } catch {} }
-              const list=process.argv[1].split(',').filter(Boolean);
-              console.log(list.filter(pl=>!reg.includes(pl)).join(','));
-            " "$MISSING")"
+              for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle','android/app/src/main/assets/capacitor.plugins.json']) { try { reg+=fs.readFileSync(f,'utf8'); } catch (e) {} }
+              const list=(process.argv[1]||'').split(',').filter(Boolean);
+              console.log(list.filter(function(pl){ return !reg.includes(pl) && !reg.includes(pl.replace(/^@/,'').replace(/\//g,'-')); }).join(','));
+            " "$1"
+          }
+
+          MISSING="$(registered_missing "$PLUGIN_LIST")"
+          if [ -n "$MISSING" ]; then
+            log "[sync] Plugins not registered after first sync: $MISSING — reinstalling and re-syncing (auto-repair)"
+            npm i $(echo "$MISSING" | tr ',' ' ') --no-audit --no-fund >/dev/null 2>&1 || true
+            $CAP sync android || true
+            MISSING2="$(registered_missing "$MISSING")"
             [ -z "$MISSING2" ] || fail "SYNC_VALIDATION_FAILED: these Capacitor plugins were not registered in the native Android project: $MISSING2"
+            log "[sync] Auto-repair succeeded — all plugins are now registered"
           fi
 
           [ -f "$PLUGINS_JSON" ] || log "[sync] WARNING: no capacitor.plugins.json (project declares no native plugins)"
-          PLUGIN_LIST="$(node -e "
-            const p=require('./package.json');
-            const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
-            const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
-            console.log(deps.filter(d=>(/^@capacitor\//.test(d)||/^@capacitor-community\//.test(d)||/^capacitor-/.test(d))&&!skip.includes(d)).join(','));
-          ")"
           log "[sync] Registered Capacitor plugins: ${PLUGIN_LIST:-none}"
           echo "APKFORGE_PLUGINS=$PLUGIN_LIST" >> "$GITHUB_ENV"
 
@@ -846,6 +1011,27 @@ jobs:
           TRACEEOF
           chmod +x /tmp/apkforge-browser-trace.sh
           bash /tmp/apkforge-browser-trace.sh post-sync
+
+          # Auto-repair: if the trace shows the Browser plugin is not declared or
+          # not installed, install it at the core major, re-sync, and re-trace.
+          if grep -q "^BROWSER_TRACE_VERDICT: stage [12]" browser-plugin-trace.txt 2>/dev/null; then
+            echo "[browser-repair] Browser plugin missing at declaration/install stage — repairing"
+            CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+            if [ -n "$CORE_MAJ" ]; then
+              npm i "@capacitor/browser@^$CORE_MAJ" --no-audit --no-fund || npm i @capacitor/browser --no-audit --no-fund || true
+            else
+              npm i @capacitor/browser --no-audit --no-fund || true
+            fi
+            npx cap sync android > /tmp/cap-sync-browser-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-sync-browser-repair.log || true
+            mv browser-plugin-trace.txt browser-plugin-trace-before-repair.txt 2>/dev/null || true
+            bash /tmp/apkforge-browser-trace.sh post-sync-repair
+            if grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
+              echo "BROWSER_TRACE_VERDICT: repaired (Browser plugin installed and registered during the build)" | tee -a "$REPORT"
+            else
+              echo "BROWSER_TRACE_VERDICT: unrepairable — see browser-plugin-trace.txt" | tee -a "$REPORT"
+            fi
+          fi
           exit 0
 
 
