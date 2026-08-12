@@ -10,7 +10,7 @@ on:
       bundle_id: { description: Reverse-DNS bundle id, required: true }
       web_dir: { description: Web build output directory, required: false, default: "www" }
       logo_url: { description: Optional signed URL to a square app icon (PNG), required: false, default: "" }
-      node_version: { description: Node.js major version (20-24), required: false, default: "22" }
+      node_version: { description: Project web-build Node.js major version (20-24), required: false, default: "22" }
       finalize_endpoint: { description: APKForge backend finalization endpoint, required: false, default: "" }
       diagnostic_endpoint: { description: APKForge sanitized runtime diagnostics endpoint, required: false, default: "" }
       diagnostic_token: { description: APKForge per-build diagnostics token, required: false, default: "" }
@@ -31,10 +31,10 @@ jobs:
       REPORT: ${{ github.workspace }}/project/android-prebuild-report.txt
     steps:
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with: { node-version: "${{ github.event.inputs.node_version }}" }
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: '21' }
       - name: Fetch source
         run: |
@@ -159,7 +159,24 @@ jobs:
             log "[capacitor] CLI missing — installing @capacitor/core @capacitor/cli (auto-repair)"
             npm i @capacitor/core @capacitor/cli || fail "Could not install the Capacitor CLI."
           fi
-          npm i @capacitor/android >/dev/null 2>&1 || npm i @capacitor/android || fail "Could not install @capacitor/android."
+
+          # Record the native CLI requirement. The web project intentionally
+          # installs/builds on its selected Node version; a dedicated setup-node
+          # step switches the subsequent native phase to Node 24. Do not use
+          # the npm "n" utility here: PATH mutations made inside a shell step are not a reliable
+          # toolchain boundary for later GitHub Actions steps.
+          REQ_NODE="$(node -e "try{const p=require('@capacitor/cli/package.json');const m=String((p.engines&&p.engines.node)||'').match(/(\d+)/);console.log(m?m[1]:'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          CUR_NODE="$(node -p "process.versions.node.split('.')[0]")"
+          if [ -n "$REQ_NODE" ] && [ "$CUR_NODE" -lt "$REQ_NODE" ]; then
+            log "[node] Capacitor CLI requires Node >= $REQ_NODE; web dependencies are installed on Node $CUR_NODE and the native phase will run on Node 24"
+          fi
+
+          CORE_MAJOR="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          if [ -n "$CORE_MAJOR" ]; then
+            npm i "@capacitor/android@$CORE_MAJOR" >/dev/null 2>&1 || npm i "@capacitor/android@$CORE_MAJOR" || fail "Could not install @capacitor/android@$CORE_MAJOR."
+          else
+            npm i @capacitor/android >/dev/null 2>&1 || npm i @capacitor/android || fail "Could not install @capacitor/android."
+          fi
           log "[capacitor] Version: $(npx cap --version 2>/dev/null || echo unknown)"
 
       - name: Verify dependencies and toolchain
@@ -558,6 +575,29 @@ jobs:
           console.log('[oauth-diagnostics] Injected sanitized callback diagnostics into ' + indexPath);
           NODEEOF
           log "[oauth-diagnostics] Sanitized runtime diagnostics injected"
+
+      # Keep the uploaded project's requested Node version for dependency
+      # installation and its web build, then use a current LTS for every native
+      # Capacitor command. This supports Node-20 web apps and Capacitor 8 in the
+      # same universal build without relying on shell-local PATH changes.
+      - name: Setup Node for native Capacitor phase
+        uses: actions/setup-node@v5
+        with: { node-version: "24" }
+
+      - name: Verify native Node runtime
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          NATIVE_NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
+          log "[native-env] Node: $(node --version)"
+          [ "$NATIVE_NODE_MAJOR" -ge 22 ] || fail "Native Capacitor phase requires Node.js 22 or newer, but $(node --version) is active."
+          CLI_REQ="$(node -e "try{const p=require('@capacitor/cli/package.json');const m=String((p.engines&&p.engines.node)||'').match(/(\d+)/);console.log(m?m[1]:'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          if [ -n "$CLI_REQ" ] && [ "$NATIVE_NODE_MAJOR" -lt "$CLI_REQ" ]; then
+            fail "Installed Capacitor CLI requires Node.js >=$CLI_REQ, but $(node --version) is active."
+          fi
+          npx --no-install cap --version | tee -a "$REPORT" || fail "The locally installed Capacitor CLI cannot run on Node $(node --version)."
 
       - name: Repair Capacitor configuration (webDir)
         working-directory: project
