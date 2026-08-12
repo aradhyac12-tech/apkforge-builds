@@ -772,61 +772,151 @@ jobs:
           fi
           log "[sync] cap sync android completed"
 
-
-          # Plugin verification happens ONLY after cap sync (never before).
           PLUGINS_JSON="android/app/src/main/assets/capacitor.plugins.json"
-          if [ ! -f "$PLUGINS_JSON" ]; then
-            log "[sync] capacitor.plugins.json missing after sync — re-running cap sync (auto-repair)"
-            $CAP sync android || true
-          fi
+          CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
 
-          # The plugin set is "declared in package.json" UNION "installed in
-          # node_modules with an android/ source folder" — a plugin pulled in
-          # transitively is just as native, and must be registered too.
-          PLUGIN_LIST="$(node -e "
-            const fs=require('fs');
-            const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
-            const isPlugin=(d)=>(/^@capacitor\//.test(d)||/^@capacitor-community\//.test(d)||/^capacitor-/.test(d))&&skip.indexOf(d)<0;
-            const set=new Set();
-            try {
-              const p=JSON.parse(fs.readFileSync('package.json','utf8'));
-              Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})}).filter(isPlugin).forEach((d)=>set.add(d));
-            } catch (e) {}
-            const scan=(dir,prefix)=>{
-              let entries=[];
-              try { entries=fs.readdirSync(dir); } catch (e) { return; }
-              for (const en of entries) {
-                const name=prefix+en;
-                if (!isPlugin(name)) continue;
-                try { fs.statSync(dir+'/'+en+'/android'); set.add(name); } catch (err) {}
-              }
-            };
-            scan('node_modules/@capacitor','@capacitor/');
-            scan('node_modules/@capacitor-community','@capacitor-community/');
-            scan('node_modules','');
-            console.log(Array.from(set).join(','));
-          " 2>/dev/null)"
-          registered_missing() {
-            node -e "
-              const fs=require('fs');
-              let reg='';
-              for (const f of ['android/capacitor.settings.gradle','android/app/capacitor.build.gradle','android/app/src/main/assets/capacitor.plugins.json']) { try { reg+=fs.readFileSync(f,'utf8'); } catch (e) {} }
-              const list=(process.argv[1]||'').split(',').filter(Boolean);
-              console.log(list.filter(function(pl){ return !reg.includes(pl) && !reg.includes(pl.replace(/^@/,'').replace(/\//g,'-')); }).join(','));
-            " "$1"
+
+          # ---------------------------------------------------------------
+          # Plugin audit. Runs ONLY after cap sync. A package counts as a
+          # native Android plugin when its own package.json declares a
+          # capacitor.android block OR it ships android/src/main sources —
+          # never merely because its name looks like a plugin. Registration is
+          # proven structurally (Gradle include slug, Gradle project
+          # dependency, capacitor.plugins.json class list), not by substring.
+          # ---------------------------------------------------------------
+          cat > /tmp/apkforge-plugin-audit.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const root = process.cwd();
+          const skip = new Set(['@capacitor/core', '@capacitor/cli', '@capacitor/android', '@capacitor/ios', '@capacitor/assets']);
+          const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return null; } };
+          const readText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return ''; } };
+          const slugOf = (name) => name.replace(/^@/, '').replace(/\//g, '-');
+
+          const candidates = new Set();
+          const rootPkg = readJson(path.join(root, 'package.json')) || {};
+          Object.keys(Object.assign({}, rootPkg.dependencies, rootPkg.devDependencies)).forEach((d) => candidates.add(d));
+          const scanDir = (dir, prefix) => {
+            let entries = [];
+            try { entries = fs.readdirSync(dir); } catch (e) { return; }
+            for (const en of entries) {
+              if (en.charAt(0) === '.') continue;
+              if (prefix === '' && en.charAt(0) === '@') continue;
+              candidates.add(prefix + en);
+            }
+          };
+          scanDir(path.join(root, 'node_modules', '@capacitor'), '@capacitor/');
+          scanDir(path.join(root, 'node_modules', '@capacitor-community'), '@capacitor-community/');
+          scanDir(path.join(root, 'node_modules', '@capgo'), '@capgo/');
+          scanDir(path.join(root, 'node_modules'), '');
+
+          // Only top-level node_modules copies count; nested duplicates are never
+          // resolved by Capacitor and must not fail the build.
+          const plugins = [];
+          for (const name of candidates) {
+            if (skip.has(name)) continue;
+            const dir = path.join(root, 'node_modules', name);
+            const pkg = readJson(path.join(dir, 'package.json'));
+            if (!pkg) continue;
+            const declaresAndroid = !!(pkg.capacitor && pkg.capacitor.android);
+            const hasAndroidSources = fs.existsSync(path.join(dir, 'android', 'src', 'main'));
+            if (!declaresAndroid && !hasAndroidSources) continue;
+            plugins.push({ name: name, slug: slugOf(name), declared: !!(rootPkg.dependencies || {})[name] || !!(rootPkg.devDependencies || {})[name] });
+          }
+          plugins.sort((a, b) => a.name.localeCompare(b.name));
+
+          const settings = readText(path.join(root, 'android', 'capacitor.settings.gradle'));
+          const buildGradle = readText(path.join(root, 'android', 'app', 'capacitor.build.gradle'));
+          const pluginsJsonPath = path.join(root, 'android', 'app', 'src', 'main', 'assets', 'capacitor.plugins.json');
+          const pluginsJsonRaw = readText(pluginsJsonPath);
+          let pluginsJson = [];
+          try { pluginsJson = JSON.parse(pluginsJsonRaw || '[]'); } catch (e) { pluginsJson = []; }
+          const jsonPkgs = new Set(pluginsJson.map((e) => (e && e.pkg) || '').filter(Boolean));
+
+          const includeSlugs = new Set();
+          const includeRe = /include\s+'([^']+)'/g;
+          let m;
+          while ((m = includeRe.exec(settings)) !== null) includeSlugs.add(m[1].replace(/^:/, ''));
+          const depSlugs = new Set();
+          const depRe = /project\(['":]+([^'")]+)['"]?\)/g;
+          while ((m = depRe.exec(buildGradle)) !== null) depSlugs.add(m[1].replace(/^:/, ''));
+
+          const rows = [];
+          const missing = [];
+          for (const p of plugins) {
+            const inSettings = includeSlugs.has(p.slug) || settings.indexOf(p.name) >= 0;
+            const inBuild = depSlugs.has(p.slug) || buildGradle.indexOf(p.name) >= 0;
+            const inJson = jsonPkgs.has(p.name) || pluginsJsonRaw.indexOf(p.name) >= 0;
+            // A plugin is registered when Gradle wires it in. capacitor.plugins.json
+            // only lists packages that expose an @CapacitorPlugin class, so a
+            // Gradle-registered plugin absent from it is legitimate.
+            const registered = inSettings && inBuild;
+            rows.push([p.name, p.declared ? 'declared' : 'transitive', inSettings ? 'gradle-settings:yes' : 'gradle-settings:NO', inBuild ? 'gradle-deps:yes' : 'gradle-deps:NO', inJson ? 'plugins.json:yes' : 'plugins.json:no'].join(' | '));
+            if (!registered) missing.push(p.name);
           }
 
-          MISSING="$(registered_missing "$PLUGIN_LIST")"
-          if [ -n "$MISSING" ]; then
-            log "[sync] Plugins not registered after first sync: $MISSING — reinstalling and re-syncing (auto-repair)"
-            npm i $(echo "$MISSING" | tr ',' ' ') --no-audit --no-fund >/dev/null 2>&1 || true
-            $CAP sync android || true
-            MISSING2="$(registered_missing "$MISSING")"
-            [ -z "$MISSING2" ] || fail "SYNC_VALIDATION_FAILED: these Capacitor plugins were not registered in the native Android project: $MISSING2"
-            log "[sync] Auto-repair succeeded — all plugins are now registered"
+          const out = [];
+          out.push('[plugins] Resolved native Android plugins: ' + (plugins.length ? plugins.map((p) => p.name).join(', ') : 'none'));
+          rows.forEach((r) => out.push('[plugins]   ' + r));
+          out.push('[plugins] capacitor.plugins.json: ' + (pluginsJsonRaw ? pluginsJson.length + ' class entries' : 'absent'));
+          console.log(out.join('\n'));
+
+          fs.writeFileSync('/tmp/apkforge-plugin-audit.json', JSON.stringify({
+            plugins: plugins.map((p) => p.name),
+            missing: missing,
+            pluginsJsonExists: !!pluginsJsonRaw,
+            rows: rows,
+          }));
+          process.exit(missing.length ? 1 : 0);
+          NODEEOF
+
+          audit() { node /tmp/apkforge-plugin-audit.cjs | tee -a "$REPORT"; }
+          audit_missing() { node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).missing.join(' '))}catch(e){console.log('')}"; }
+
+          # Repair ladder — each rung is attempted before the build is allowed to fail.
+          if ! audit; then
+            MISSING="$(audit_missing)"
+            log "REPAIR: plugins not registered after first sync: $MISSING — reinstalling at the Capacitor core major"
+            for P in $MISSING; do
+              if [ -n "$CORE_MAJ" ]; then npm i "$P@^$CORE_MAJ" --no-audit --no-fund >/dev/null 2>&1 || npm i "$P" --no-audit --no-fund >/dev/null 2>&1 || true
+              else npm i "$P" --no-audit --no-fund >/dev/null 2>&1 || true; fi
+            done
+            $CAP sync android > /tmp/cap-sync-repair-1.log 2>&1 || true
+            tail -n 30 /tmp/cap-sync-repair-1.log || true
           fi
 
-          [ -f "$PLUGINS_JSON" ] || log "[sync] WARNING: no capacitor.plugins.json (project declares no native plugins)"
+          if ! audit; then
+            log "REPAIR: running cap update android"
+            $CAP update android > /tmp/cap-update.log 2>&1 || true
+            tail -n 30 /tmp/cap-update.log || true
+            $CAP sync android > /tmp/cap-sync-repair-2.log 2>&1 || true
+          fi
+
+          if ! audit; then
+            log "REPAIR: regenerating the native Android project from scratch (last resort)"
+            rm -rf android
+            $CAP add android > /tmp/cap-add-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-add-repair.log || true
+            $CAP sync android > /tmp/cap-sync-repair-3.log 2>&1 || true
+          fi
+
+          if ! audit; then
+            MISSING="$(audit_missing)"
+            log "[plugins] Per-plugin evidence:"
+            node -e "try{JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).rows.forEach(function(r){console.log('  '+r)})}catch(e){}" | tee -a "$REPORT"
+            fail "SYNC_VALIDATION_FAILED: these Capacitor plugins were not registered in the native Android project after install, cap sync, cap update and a full native regeneration: $MISSING"
+          fi
+
+          PLUGIN_LIST="$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).plugins.join(','))}catch(e){console.log('')}")"
+          PLUGINS_JSON_EXISTS="$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).pluginsJsonExists?'1':'')}catch(e){console.log('')}")"
+          if [ -n "$PLUGIN_LIST" ] && [ -z "$PLUGINS_JSON_EXISTS" ]; then
+            log "REPAIR: capacitor.plugins.json is still absent with $PLUGIN_LIST registered — re-running cap sync"
+            $CAP sync android || true
+            [ -f "$PLUGINS_JSON" ] || fail "SYNC_VALIDATION_FAILED: capacitor.plugins.json was not generated even though native plugins are registered ($PLUGIN_LIST). Gradle must not run without it."
+          fi
+          if [ -z "$PLUGIN_LIST" ]; then
+            log "[sync] Project declares no native Capacitor plugins"
+          fi
           log "[sync] Registered Capacitor plugins: ${PLUGIN_LIST:-none}"
           echo "APKFORGE_PLUGINS=$PLUGIN_LIST" >> "$GITHUB_ENV"
 
@@ -1012,10 +1102,10 @@ jobs:
           chmod +x /tmp/apkforge-browser-trace.sh
           bash /tmp/apkforge-browser-trace.sh post-sync
 
-          # Auto-repair: if the trace shows the Browser plugin is not declared or
-          # not installed, install it at the core major, re-sync, and re-trace.
-          if grep -q "^BROWSER_TRACE_VERDICT: stage [12]" browser-plugin-trace.txt 2>/dev/null; then
-            echo "[browser-repair] Browser plugin missing at declaration/install stage — repairing"
+          # Auto-repair ladder: install at the core major, re-sync, then
+          # cap update, then a full native regeneration before giving up.
+          if grep -q "^BROWSER_TRACE_VERDICT: stage" browser-plugin-trace.txt 2>/dev/null; then
+            echo "[browser-repair] Browser plugin trace reported a gap — repairing"
             CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
             if [ -n "$CORE_MAJ" ]; then
               npm i "@capacitor/browser@^$CORE_MAJ" --no-audit --no-fund || npm i @capacitor/browser --no-audit --no-fund || true
@@ -1026,6 +1116,20 @@ jobs:
             tail -n 40 /tmp/cap-sync-browser-repair.log || true
             mv browser-plugin-trace.txt browser-plugin-trace-before-repair.txt 2>/dev/null || true
             bash /tmp/apkforge-browser-trace.sh post-sync-repair
+            if ! grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
+              echo "[browser-repair] Still missing — running cap update android"
+              npx cap update android > /tmp/cap-update-browser-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-browser-repair-2.log 2>&1 || true
+              bash /tmp/apkforge-browser-trace.sh post-update-repair
+            fi
+            if ! grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
+              echo "[browser-repair] Still missing — regenerating the native Android project"
+              rm -rf android
+              npx cap add android > /tmp/cap-add-browser-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-browser-repair-3.log 2>&1 || true
+              bash /tmp/apkforge-browser-trace.sh post-regenerate-repair
+            fi
+
             if grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
               echo "BROWSER_TRACE_VERDICT: repaired (Browser plugin installed and registered during the build)" | tee -a "$REPORT"
             else
@@ -1241,6 +1345,48 @@ jobs:
           node /tmp/apkforge-native-check.cjs
           echo "PREBUILD_VALIDATION_PASSED" | tee -a "$REPORT"
 
+      - name: OAuth readiness validation
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          SETTINGS="android/capacitor.settings.gradle"
+          PJ="android/app/src/main/assets/capacitor.plugins.json"
+          FATAL=""
+          check() {
+            # check <label> <condition-result> <fatal|warn>
+            if [ "$2" = "0" ]; then log "OAUTH_READY: $1"; else
+              if [ "$3" = "fatal" ]; then log "OAUTH_FAIL: $1"; FATAL="$FATAL; $1"; else log "OAUTH_WARN: $1"; fi
+            fi
+          }
+          has() { grep -qF "$1" "$2" 2>/dev/null; echo $?; }
+
+          OAUTH_SIGNAL=""
+          grep -rIlqE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios "@supabase/supabase-js|firebase/auth|@auth0/|@clerk/|signInWithOAuth|oauth" . 2>/dev/null && OAUTH_SIGNAL=1
+
+          if [ -n "$OAUTH_SIGNAL" ]; then
+            check "@capacitor/browser registered in Gradle" "$(has '@capacitor/browser' "$SETTINGS")" fatal
+            check "@capacitor/app registered in Gradle" "$(has '@capacitor/app' "$SETTINGS")" fatal
+            check "BrowserPlugin present in capacitor.plugins.json" "$(has 'BrowserPlugin' "$PJ")" fatal
+            check "AppPlugin present in capacitor.plugins.json" "$(has 'AppPlugin' "$PJ")" warn
+          else
+            log "OAUTH_READY: no auth SDK detected — OAuth checks are advisory only"
+            check "@capacitor/app registered in Gradle" "$(has '@capacitor/app' "$SETTINGS")" warn
+          fi
+          check "custom-scheme intent filter present" "$(has 'android:scheme=' "$MANIFEST")" warn
+          check "app-link (https) intent filter present" "$(grep -c 'android:scheme="https"' "$MANIFEST" >/dev/null 2>&1 && grep -q 'android:scheme="https"' "$MANIFEST" && echo 0 || echo 1)" warn
+          check "launchMode=singleTask on MainActivity" "$(has 'android:launchMode="singleTask"' "$MANIFEST")" fatal
+          check "appUrlOpen bridge injected" "$(grep -rq 'appUrlOpen' android/app/src/main 2>/dev/null && echo 0 || echo 1)" warn
+
+          if [ -n "$FATAL" ]; then
+            echo "OAUTH_VALIDATION_FAILED:$FATAL" | tee -a "$REPORT"
+            echo "::error::OAuth readiness validation failed:$FATAL"
+            exit 1
+          fi
+          log "[oauth] OAuth readiness validated"
+
+
       - name: Inject Android lifecycle diagnostics
         working-directory: project
         run: |
@@ -1439,8 +1585,16 @@ jobs:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
         run: |
           set -e
-          # Gradle wrapper preflight (toolchain verification, part 2).
-          [ -f ./gradlew ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradlew is missing from the generated native project." | tee -a "$REPORT"; exit 1; }
+          # Gradle wrapper preflight (toolchain verification, part 2) — repair first.
+          if [ ! -f ./gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.properties ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "REPAIR: Gradle wrapper is incomplete — regenerating the native Android project" | tee -a "$REPORT"
+            cd ..
+            rm -rf android
+            npx cap add android >> "$REPORT" 2>&1 || true
+            npx cap sync android >> "$REPORT" 2>&1 || true
+            cd android
+          fi
+          [ -f ./gradlew ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradlew is missing and could not be regenerated." | tee -a "$REPORT"; exit 1; }
           [ -f gradle/wrapper/gradle-wrapper.properties ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradle/wrapper/gradle-wrapper.properties is missing, so no Gradle version is declared." | tee -a "$REPORT"; exit 1; }
           grep -n "distributionUrl" gradle/wrapper/gradle-wrapper.properties | tee -a "$REPORT"
           chmod +x ./gradlew
