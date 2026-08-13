@@ -675,9 +675,52 @@ jobs:
           # cannot return to the app without Browser + App).
           SRC_HITS=/tmp/plugin-signals.txt
           : > "$SRC_HITS"
-          grep -rIloE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios --exclude-dir=.git --exclude-dir=dist --exclude-dir=build \
+          # -h -o: record the matched TOKENS, not the file names. (Matching file
+          # names made every "@capacitor/x" probe below silently fail, which is
+          # how a project that imports @capacitor/preferences could reach cap
+          # sync without the package installed.)
+          grep -rIhoE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios --exclude-dir=.git \
             "@capacitor/[a-z-]+|@supabase/supabase-js|firebase/auth|@auth0/|@clerk/|appwrite|amazon-cognito|oidc-client|signInWithOAuth|signInWithRedirect|loginWithRedirect|authorize\(|oauth|getUserMedia|navigator\.geolocation|localStorage|serviceWorker|Notification\.requestPermission|<input[^>]+type=[\"']file[\"']|qr|barcode|biometric|webauthn" . 2>/dev/null \
             | sort -u > "$SRC_HITS" || true
+
+          # Bundlers rewrite "@capacitor/preferences" out of the built output,
+          # but Capacitor's registerPlugin('<Name>') call survives minification.
+          # Map those runtime plugin names back to their packages so a project
+          # shipping only built assets still gets its native plugins installed.
+          if [ -n "$RESOLVED_WEB_DIR" ] && [ -d "$RESOLVED_WEB_DIR" ]; then
+            grep -rIhoE "registerPlugin\(\s*[\"'][A-Za-z0-9_]+[\"']" "$RESOLVED_WEB_DIR" 2>/dev/null \
+              | grep -oE "[\"'][A-Za-z0-9_]+[\"']" | tr -d "\"'" | sort -u > /tmp/plugin-runtime-names.txt || true
+            while read -r PNAME; do
+              [ -n "$PNAME" ] || continue
+              case "$PNAME" in
+                Preferences) echo "@capacitor/preferences" ;;
+                Browser) echo "@capacitor/browser" ;;
+                App) echo "@capacitor/app" ;;
+                Camera) echo "@capacitor/camera" ;;
+                Geolocation) echo "@capacitor/geolocation" ;;
+                Filesystem) echo "@capacitor/filesystem" ;;
+                PushNotifications) echo "@capacitor/push-notifications" ;;
+                LocalNotifications) echo "@capacitor/local-notifications" ;;
+                Network) echo "@capacitor/network" ;;
+                Haptics) echo "@capacitor/haptics" ;;
+                StatusBar) echo "@capacitor/status-bar" ;;
+                SplashScreen) echo "@capacitor/splash-screen" ;;
+                Share) echo "@capacitor/share" ;;
+                Toast) echo "@capacitor/toast" ;;
+                Device) echo "@capacitor/device" ;;
+                Clipboard) echo "@capacitor/clipboard" ;;
+                Keyboard) echo "@capacitor/keyboard" ;;
+                ActionSheet) echo "@capacitor/action-sheet" ;;
+                Dialog) echo "@capacitor/dialog" ;;
+                ScreenOrientation) echo "@capacitor/screen-orientation" ;;
+                TextZoom) echo "@capacitor/text-zoom" ;;
+                Motion) echo "@capacitor/motion" ;;
+              esac
+            done < /tmp/plugin-runtime-names.txt >> "$SRC_HITS"
+            sort -u -o "$SRC_HITS" "$SRC_HITS"
+            log "[plugins] Runtime plugin names in built assets: $(tr '\n' ' ' < /tmp/plugin-runtime-names.txt)"
+          fi
+          log "[plugins] Capacitor packages referenced by the project: $(grep -oE '@capacitor/[a-z-]+' "$SRC_HITS" | sort -u | tr '\n' ' ')"
           DEPS_TXT="$(node -e "const d=require('./package.json');console.log(Object.keys({...(d.dependencies||{}),...(d.devDependencies||{})}).join(' '))" 2>/dev/null || echo '')"
           sig() { grep -qiE "$1" "$SRC_HITS" 2>/dev/null || echo "$DEPS_TXT" | grep -qiE "$1"; }
 
@@ -731,6 +774,16 @@ jobs:
           if need haptics "haptic|vibrate"; then add_plugin "@capacitor/haptics"; fi
           if need status-bar "statusbar|safe-area"; then add_plugin "@capacitor/status-bar"; fi
           if need splash-screen "splash"; then add_plugin "@capacitor/splash-screen"; fi
+
+          # Catch-all: any @capacitor/* package the project actually references
+          # (source import or runtime registerPlugin name) that is not declared
+          # in package.json gets installed too — no per-plugin allowlist.
+          for PKG in $(grep -oE '@capacitor/[a-z-]+' "$SRC_HITS" 2>/dev/null | sort -u); do
+            case "$PKG" in
+              @capacitor/core|@capacitor/cli|@capacitor/android|@capacitor/ios|@capacitor/assets) continue ;;
+            esac
+            declared "$PKG" || add_plugin "$PKG"
+          done
 
           if [ -z "$ADDED" ]; then log "[plugins] No additional Capacitor plugins required"; fi
           log "[plugins] Auto-installed:${ADDED:- none}"
@@ -832,6 +885,25 @@ jobs:
           const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return null; } };
           const readText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return ''; } };
           const slugOf = (name) => name.replace(/^@/, '').replace(/\//g, '-');
+          // True when the package ships an @CapacitorPlugin-annotated class:
+          // those MUST appear in capacitor.plugins.json or the Android bridge
+          // never registers them and the JS call fails with
+          // "<X> plugin is not implemented on android".
+          const shipsPluginClass = (dir) => {
+            const stack = [path.join(dir, 'android', 'src', 'main')];
+            while (stack.length) {
+              const cur = stack.pop();
+              let entries = [];
+              try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch (e) { continue; }
+              for (const en of entries) {
+                const full = path.join(cur, en.name);
+                if (en.isDirectory()) { stack.push(full); continue; }
+                if (!/\.(java|kt)$/.test(en.name)) continue;
+                if (readText(full).indexOf('@CapacitorPlugin') >= 0) return true;
+              }
+            }
+            return false;
+          };
 
           const candidates = new Set();
           const rootPkg = readJson(path.join(root, 'package.json')) || {};
@@ -861,7 +933,12 @@ jobs:
             const declaresAndroid = !!(pkg.capacitor && pkg.capacitor.android);
             const hasAndroidSources = fs.existsSync(path.join(dir, 'android', 'src', 'main'));
             if (!declaresAndroid && !hasAndroidSources) continue;
-            plugins.push({ name: name, slug: slugOf(name), declared: !!(rootPkg.dependencies || {})[name] || !!(rootPkg.devDependencies || {})[name] });
+            plugins.push({
+              name: name,
+              slug: slugOf(name),
+              declared: !!(rootPkg.dependencies || {})[name] || !!(rootPkg.devDependencies || {})[name],
+              needsJson: shipsPluginClass(dir),
+            });
           }
           plugins.sort((a, b) => a.name.localeCompare(b.name));
 
@@ -887,11 +964,11 @@ jobs:
             const inSettings = includeSlugs.has(p.slug) || settings.indexOf(p.name) >= 0;
             const inBuild = depSlugs.has(p.slug) || buildGradle.indexOf(p.name) >= 0;
             const inJson = jsonPkgs.has(p.name) || pluginsJsonRaw.indexOf(p.name) >= 0;
-            // A plugin is registered when Gradle wires it in. capacitor.plugins.json
-            // only lists packages that expose an @CapacitorPlugin class, so a
-            // Gradle-registered plugin absent from it is legitimate.
-            const registered = inSettings && inBuild;
-            rows.push([p.name, p.declared ? 'declared' : 'transitive', inSettings ? 'gradle-settings:yes' : 'gradle-settings:NO', inBuild ? 'gradle-deps:yes' : 'gradle-deps:NO', inJson ? 'plugins.json:yes' : 'plugins.json:no'].join(' | '));
+            // Gradle wiring alone is not enough: a package exposing an
+            // @CapacitorPlugin class must also be listed in
+            // capacitor.plugins.json, which is what the runtime bridge reads.
+            const registered = inSettings && inBuild && (!p.needsJson || inJson);
+            rows.push([p.name, p.declared ? 'declared' : 'transitive', inSettings ? 'gradle-settings:yes' : 'gradle-settings:NO', inBuild ? 'gradle-deps:yes' : 'gradle-deps:NO', p.needsJson ? (inJson ? 'plugins.json:yes' : 'plugins.json:NO (required)') : 'plugins.json:n/a'].join(' | '));
             if (!registered) missing.push(p.name);
           }
 
@@ -903,6 +980,7 @@ jobs:
 
           fs.writeFileSync('/tmp/apkforge-plugin-audit.json', JSON.stringify({
             plugins: plugins.map((p) => p.name),
+            runtimePlugins: plugins.filter((p) => p.needsJson).map((p) => p.name),
             missing: missing,
             pluginsJsonExists: !!pluginsJsonRaw,
             rows: rows,
@@ -959,6 +1037,9 @@ jobs:
           fi
           log "[sync] Registered Capacitor plugins: ${PLUGIN_LIST:-none}"
           echo "APKFORGE_PLUGINS=$PLUGIN_LIST" >> "$GITHUB_ENV"
+          RUNTIME_LIST="$(node -e "try{console.log((JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).runtimePlugins||[]).join(','))}catch(e){console.log('')}")"
+          log "[sync] Plugins that must appear in capacitor.plugins.json: ${RUNTIME_LIST:-none}"
+          echo "APKFORGE_RUNTIME_PLUGINS=$RUNTIME_LIST" >> "$GITHUB_ENV"
 
       - name: Browser plugin forensic trace (post-sync)
         if: success() || failure()
@@ -1712,14 +1793,16 @@ jobs:
 
           unzip -l "$APK" | grep -q "assets/public/index.html" || fail "Web assets are missing from the APK (assets/public/index.html not found)."
           log "Web assets: bundled"
-          if [ -n "${APKFORGE_PLUGINS:-}" ]; then
+          # Only packages that expose an @CapacitorPlugin class are expected in
+          # capacitor.plugins.json; Gradle-only helper packages are not.
+          if [ -n "${APKFORGE_RUNTIME_PLUGINS:-}" ]; then
             unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-plugins.json 2>/dev/null || fail "capacitor.plugins.json is missing from the packaged APK — Capacitor plugins were not bundled."
             cat /tmp/apk-plugins.json | tee -a "$VERIFY"
             MISSING_IN_APK=""
-            for p in $(echo "$APKFORGE_PLUGINS" | tr ',' ' '); do
+            for p in $(echo "$APKFORGE_RUNTIME_PLUGINS" | tr ',' ' '); do
               grep -q "\"$p\"" /tmp/apk-plugins.json || MISSING_IN_APK="$MISSING_IN_APK $p"
             done
-            [ -z "$MISSING_IN_APK" ] || fail "These Capacitor plugins are missing from the packaged APK:$MISSING_IN_APK"
+            [ -z "$MISSING_IN_APK" ] || fail "These Capacitor plugins are registered in the project but missing from the packaged APK's assets/capacitor.plugins.json, so they would fail at runtime with \"plugin is not implemented on android\":$MISSING_IN_APK"
             log "Packaged plugins: verified"
           else
             log "No Capacitor plugins declared — skipping packaged plugin check"
