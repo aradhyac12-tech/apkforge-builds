@@ -83,19 +83,52 @@ jobs:
             echo '{"name":"apkforge-app","version":"1.0.0","private":true}' > package.json
           fi
 
-          PM="npm"; INSTALL_CMD="npm install --no-audit --no-fund"; RUN_CMD="npm run"; EXEC_CMD="npx"
-          if [ -f bun.lockb ] || [ -f bun.lock ]; then
-            PM="bun"
-            command -v bun >/dev/null 2>&1 || npm install -g bun
-            INSTALL_CMD="bun install"; RUN_CMD="bun run"; EXEC_CMD="bunx"
-          elif [ -f pnpm-lock.yaml ]; then
-            PM="pnpm"; corepack enable; corepack prepare pnpm@latest --activate
-            INSTALL_CMD="pnpm install --no-frozen-lockfile"; RUN_CMD="pnpm run"; EXEC_CMD="pnpm exec"
-          elif [ -f yarn.lock ]; then
-            PM="yarn"; corepack enable; corepack prepare yarn@stable --activate
-            INSTALL_CMD="yarn install"; RUN_CMD="yarn"; EXEC_CMD="yarn"
+          # ---- Deterministic package-manager selection -------------------
+          # packageManager wins; otherwise the lockfile decides. When several
+          # lockfiles exist without packageManager we pick one deterministically
+          # (bun > pnpm > yarn > npm) and say so loudly — we never mix managers.
+          PM_FIELD="$(node -e "try{console.log(require('./package.json').packageManager||'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          LOCKS=""
+          if [ -f bun.lockb ] || [ -f bun.lock ]; then LOCKS="$LOCKS bun"; fi
+          if [ -f pnpm-lock.yaml ]; then LOCKS="$LOCKS pnpm"; fi
+          if [ -f yarn.lock ]; then LOCKS="$LOCKS yarn"; fi
+          if [ -f package-lock.json ]; then LOCKS="$LOCKS npm"; fi
+          LOCK_COUNT="$(echo $LOCKS | wc -w)"
+          PM=""
+          case "$PM_FIELD" in
+            bun*) PM="bun" ;;
+            pnpm*) PM="pnpm" ;;
+            yarn*) PM="yarn" ;;
+            npm*) PM="npm" ;;
+          esac
+          if [ -n "$PM" ]; then
+            log "[detect] Package manager from package.json packageManager: $PM_FIELD"
+          else
+            PM="$(echo $LOCKS | awk '{print $1}')"
+            [ -n "$PM" ] || PM="npm"
+            if [ "$LOCK_COUNT" -gt 1 ]; then
+              log "[detect] WARNING: multiple lockfiles present ($LOCKS) and no packageManager field."
+              log "[detect] Deterministically selecting \"$PM\". Add a packageManager field to package.json to make this explicit."
+            fi
           fi
-          log "[detect] Package manager: $PM"
+          case "$PM" in
+            bun)
+              command -v bun >/dev/null 2>&1 || curl -fsSL https://bun.sh/install | bash
+              export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"; export PATH="$BUN_INSTALL/bin:$PATH"
+              echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
+              command -v bun >/dev/null 2>&1 || fail "Project uses Bun but the Bun runtime could not be installed on the runner."
+              INSTALL_CMD="bun install"; ADD_CMD="bun add"; RUN_CMD="bun run"; EXEC_CMD="bunx" ;;
+            pnpm)
+              corepack enable; corepack prepare pnpm@latest --activate
+              INSTALL_CMD="pnpm install --no-frozen-lockfile"; ADD_CMD="pnpm add"; RUN_CMD="pnpm run"; EXEC_CMD="pnpm exec" ;;
+            yarn)
+              corepack enable; corepack prepare yarn@stable --activate
+              INSTALL_CMD="yarn install"; ADD_CMD="yarn add"; RUN_CMD="yarn"; EXEC_CMD="yarn" ;;
+            *)
+              PM="npm"
+              INSTALL_CMD="npm install --no-audit --no-fund"; ADD_CMD="npm install --no-audit --no-fund"; RUN_CMD="npm run"; EXEC_CMD="npx" ;;
+          esac
+          log "[detect] Package manager: $PM (lockfiles:${LOCKS:- none})"
 
           FRAMEWORK="$(node -e "
             const p=require('./package.json');
@@ -128,6 +161,8 @@ jobs:
 
           {
             echo "PM=$PM"
+            echo "INSTALL_CMD=$INSTALL_CMD"
+            echo "ADD_CMD=$ADD_CMD"
             echo "RUN_CMD=$RUN_CMD"
             echo "EXEC_CMD=$EXEC_CMD"
             echo "DETECTED_FRAMEWORK=$FRAMEWORK"
@@ -136,10 +171,12 @@ jobs:
 
           if $INSTALL_CMD; then
             log "[install] Dependencies installed with $PM"
-          else
-            log "[install] $PM install failed — retrying with npm --legacy-peer-deps (auto-repair)"
+          elif [ "$PM" = "npm" ]; then
+            log "REPAIR: npm install failed — retrying once with --legacy-peer-deps"
             npm install --no-audit --no-fund --legacy-peer-deps || fail "Dependency install failed for this project. Check the log above for the failing package."
-            log "[install] Recovered with npm --legacy-peer-deps"
+            log "REPAIR: recovered with npm --legacy-peer-deps (peer ranges were relaxed)"
+          else
+            fail "Dependency install failed with $PM. The project's lockfile selects $PM, so we do not fall back to another package manager — fix the failing package or commit a consistent lockfile."
           fi
 
           # Align Capacitor packages so core/cli/android share a major version.
@@ -156,28 +193,27 @@ jobs:
           if node -e "require.resolve('@capacitor/cli')" 2>/dev/null; then
             log "[capacitor] CLI present"
           else
-            log "[capacitor] CLI missing — installing @capacitor/core @capacitor/cli (auto-repair)"
-            npm i @capacitor/core @capacitor/cli || fail "Could not install the Capacitor CLI."
+            log "REPAIR: Capacitor CLI missing — installing @capacitor/core @capacitor/cli with $PM"
+            $ADD_CMD @capacitor/core @capacitor/cli || fail "Could not install the Capacitor CLI with $PM."
           fi
 
-          # Record the native CLI requirement. The web project intentionally
-          # installs/builds on its selected Node version; a dedicated setup-node
-          # step switches the subsequent native phase to Node 24. Do not use
-          # the npm "n" utility here: PATH mutations made inside a shell step are not a reliable
-          # toolchain boundary for later GitHub Actions steps.
+          # One Node version for the entire build. APKForge already raises the
+          # dispatched node_version to Capacitor's minimum, so a mismatch here is
+          # a hard failure rather than a silent mid-build toolchain switch.
           REQ_NODE="$(node -e "try{const p=require('@capacitor/cli/package.json');const m=String((p.engines&&p.engines.node)||'').match(/(\d+)/);console.log(m?m[1]:'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
           CUR_NODE="$(node -p "process.versions.node.split('.')[0]")"
           if [ -n "$REQ_NODE" ] && [ "$CUR_NODE" -lt "$REQ_NODE" ]; then
-            log "[node] Capacitor CLI requires Node >= $REQ_NODE; web dependencies are installed on Node $CUR_NODE and the native phase will run on Node 24"
+            fail "The installed Capacitor CLI requires Node >= $REQ_NODE but this build runs on Node $CUR_NODE. Raise the project's Node version (.nvmrc / engines.node) to $REQ_NODE or newer and rebuild — we do not switch Node midway through a build."
           fi
+          log "[node] Single build Node version: $CUR_NODE (Capacitor CLI requires >= ${REQ_NODE:-unknown})"
 
           CORE_MAJOR="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null || echo "")"
           if [ -n "$CORE_MAJOR" ]; then
-            npm i "@capacitor/android@$CORE_MAJOR" >/dev/null 2>&1 || npm i "@capacitor/android@$CORE_MAJOR" || fail "Could not install @capacitor/android@$CORE_MAJOR."
+            $ADD_CMD "@capacitor/android@^$CORE_MAJOR" || fail "Could not install @capacitor/android@^$CORE_MAJOR with $PM."
           else
-            npm i @capacitor/android >/dev/null 2>&1 || npm i @capacitor/android || fail "Could not install @capacitor/android."
+            $ADD_CMD @capacitor/android || fail "Could not install @capacitor/android with $PM."
           fi
-          log "[capacitor] Version: $(npx cap --version 2>/dev/null || echo unknown)"
+          log "[capacitor] Version: $($EXEC_CMD cap --version 2>/dev/null || echo unknown)"
 
       - name: Verify dependencies and toolchain
         working-directory: project
@@ -210,13 +246,13 @@ jobs:
             " 2>/dev/null
           }
 
+          # Single package manager for every install in this build.
           install_pkgs() {
-            case "${PM:-npm}" in
-              bun) bun add $1 || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
-              pnpm) pnpm add $1 || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
-              yarn) yarn add $1 || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
-              *) npm i $1 --no-audit --no-fund || npm i $1 --no-audit --no-fund --legacy-peer-deps || true ;;
-            esac
+            if [ "${PM:-npm}" = "npm" ]; then
+              npm install --no-audit --no-fund $1 || npm install --no-audit --no-fund --legacy-peer-deps $1 || true
+            else
+              ${ADD_CMD:-npm install} $1 || true
+            fi
           }
 
           REPAIRS=""
@@ -232,23 +268,13 @@ jobs:
             MISSING="$(missing_list)"
           fi
           if [ -n "$MISSING" ]; then
-            log "[deps] Repair 2/3 — full reinstall with ${PM:-npm}"
-            case "${PM:-npm}" in
-              bun) bun install || true ;;
-              pnpm) pnpm install --no-frozen-lockfile || true ;;
-              yarn) yarn install || true ;;
-              *) npm install --no-audit --no-fund || true ;;
-            esac
-            REPAIRS="$REPAIRS full-reinstall"
+            log "[deps] Repair 2/2 — clean reinstall with ${PM:-npm}"
+            rm -rf node_modules
+            ${INSTALL_CMD:-npm install --no-audit --no-fund} || true
+            REPAIRS="$REPAIRS clean-reinstall"
             MISSING="$(missing_list)"
           fi
-          if [ -n "$MISSING" ]; then
-            log "[deps] Repair 3/3 — npm install --legacy-peer-deps"
-            npm install --no-audit --no-fund --legacy-peer-deps || true
-            REPAIRS="$REPAIRS legacy-peer-deps"
-            MISSING="$(missing_list)"
-          fi
-          [ -z "$MISSING" ] || fail "These declared packages could not be installed after three repair attempts:$MISSING"
+          [ -z "$MISSING" ] || fail "These declared packages could not be installed with ${PM:-npm} after repair:$MISSING"
           log "[deps] All declared dependencies and devDependencies resolve inside node_modules"
 
           # Health check (missing / invalid / duplicated / peer-incompatible).
@@ -294,6 +320,7 @@ jobs:
               bun) : ;;
               *) npm dedupe --no-audit --no-fund >/dev/null 2>&1 || true ;;
             esac
+            log "REPAIR: deduplicated packages with ${PM:-npm}"
             REPAIRS="$REPAIRS dedupe"
             MISSING="$(missing_list)"
             [ -z "$MISSING" ] || install_pkgs "$MISSING"
@@ -407,20 +434,46 @@ jobs:
         run: |
           set -e
           log() { echo "$1" | tee -a "$REPORT"; }
+          BUILD_STARTED_AT="$(date +%s)"
           if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
+            # Clean only generated output so a failed build can never be masked
+            # by stale assets from the uploaded zip.
+            for stale in dist build out .output .nuxt .svelte-kit/output; do
+              if [ -d "$stale" ]; then rm -rf "$stale"; log "[web] Cleaned stale output: $stale"; fi
+            done
             if $RUN_CMD build; then
               log "[web] Build script completed"
             else
-              log "[web] WARNING: build script failed — continuing with existing web assets"
+              log "PREBUILD_VALIDATION_FAILED: WEB_BUILD_FAILED"
+              log "  Command: ${RUN_CMD:-npm run} build"
+              log "  Package manager: ${PM:-npm}   Node: $(node --version)"
+              echo "::error::The project's web build script failed. Stale web assets are never reused — fix the build script and retry."
+              exit 1
             fi
           else
             log "[web] No build script — using shipped web assets"
           fi
-          # Resolve the real web output dir (never assume).
+          # Resolve the real web output dir: explicit config, then framework
+          # mapping, then any directory that genuinely contains the build.
           RESOLVED=""
           if [ -n "${WEB_DIR:-}" ] && [ -f "$WEB_DIR/index.html" ]; then RESOLVED="$WEB_DIR"; fi
           if [ -z "$RESOLVED" ]; then
-            for c in dist build out www public .output/public dist/spa dist/browser build/client .svelte-kit/output/client .nuxt/dist/client app/build; do
+            case "${DETECTED_FRAMEWORK:-}" in
+              tanstack-start|nuxt) FW_DIRS=".output/public" ;;
+              next) FW_DIRS="out" ;;
+              astro|vite|vue|react|ionic) FW_DIRS="dist" ;;
+              sveltekit) FW_DIRS="build .svelte-kit/output/client" ;;
+              angular) FW_DIRS="$(ls -d dist/*/browser dist/* 2>/dev/null | tr '\n' ' ')" ;;
+              remix) FW_DIRS="build/client" ;;
+              *) FW_DIRS="" ;;
+            esac
+            for c in $FW_DIRS; do
+              c="${c%/}"
+              if [ -z "$RESOLVED" ] && [ -f "$c/index.html" ]; then RESOLVED="$c"; log "[web] Framework output (${DETECTED_FRAMEWORK:-unknown}): $c"; fi
+            done
+          fi
+          if [ -z "$RESOLVED" ]; then
+            for c in dist build out www .output/public dist/spa dist/browser build/client .svelte-kit/output/client .nuxt/dist/client app/build public; do
               if [ -z "$RESOLVED" ] && [ -f "$c/index.html" ]; then RESOLVED="$c"; fi
             done
           fi
@@ -446,6 +499,20 @@ jobs:
             exit 1
           fi
           log "[web] Web directory: $RESOLVED"
+          # The build output must be real: non-empty, with JS/CSS assets, and
+          # newer than this step when a build script actually ran.
+          if [ ! -s "$RESOLVED/index.html" ]; then
+            echo "::error::$RESOLVED/index.html is empty — the web build did not produce usable output."
+            log "PREBUILD_VALIDATION_FAILED: WEB_OUTPUT_EMPTY ($RESOLVED/index.html)"
+            exit 1
+          fi
+          ASSET_COUNT="$(find "$RESOLVED" -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.css' \) 2>/dev/null | wc -l)"
+          log "[web] Output files: $(find "$RESOLVED" -type f | wc -l) (JS/CSS assets: $ASSET_COUNT)"
+          if [ "$ASSET_COUNT" -eq 0 ]; then
+            echo "::error::No JavaScript or CSS assets found in $RESOLVED — the web build output looks incomplete."
+            log "PREBUILD_VALIDATION_FAILED: WEB_OUTPUT_NO_ASSETS ($RESOLVED)"
+            exit 1
+          fi
           echo "RESOLVED_WEB_DIR=$RESOLVED" >> "$GITHUB_ENV"
 
 
@@ -576,14 +643,9 @@ jobs:
           NODEEOF
           log "[oauth-diagnostics] Sanitized runtime diagnostics injected"
 
-      # Keep the uploaded project's requested Node version for dependency
-      # installation and its web build, then use a current LTS for every native
-      # Capacitor command. This supports Node-20 web apps and Capacitor 8 in the
-      # same universal build without relying on shell-local PATH changes.
-      - name: Setup Node for native Capacitor phase
-        uses: actions/setup-node@v5
-        with: { node-version: "24" }
-
+      # One Node version for the whole build. APKForge raises the dispatched
+      # node_version to the Capacitor minimum before dispatch, so there is no
+      # mid-build toolchain switch to reason about.
       - name: Verify native Node runtime
         working-directory: project
         run: |
@@ -591,11 +653,10 @@ jobs:
           log() { echo "$1" | tee -a "$REPORT"; }
           fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
           NATIVE_NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
-          log "[native-env] Node: $(node --version)"
-          [ "$NATIVE_NODE_MAJOR" -ge 22 ] || fail "Native Capacitor phase requires Node.js 22 or newer, but $(node --version) is active."
+          log "[native-env] Node (same as web phase): $(node --version)"
           CLI_REQ="$(node -e "try{const p=require('@capacitor/cli/package.json');const m=String((p.engines&&p.engines.node)||'').match(/(\d+)/);console.log(m?m[1]:'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
           if [ -n "$CLI_REQ" ] && [ "$NATIVE_NODE_MAJOR" -lt "$CLI_REQ" ]; then
-            fail "Installed Capacitor CLI requires Node.js >=$CLI_REQ, but $(node --version) is active."
+            fail "The installed Capacitor CLI requires Node.js >=$CLI_REQ, but this build runs on $(node --version). Set .nvmrc / engines.node to $CLI_REQ or newer and rebuild."
           fi
           npx --no-install cap --version | tee -a "$REPORT" || fail "The locally installed Capacitor CLI cannot run on Node $(node --version)."
 
@@ -747,7 +808,7 @@ jobs:
             case " $ADDED " in *" $1 "*) return 0 ;; esac
             SPEC="$1"
             if [ -n "$CORE_MAJ" ]; then SPEC="$1@^$CORE_MAJ"; fi
-            if npm i "$SPEC" --no-audit --no-fund >/dev/null 2>&1 || npm i "$1" --no-audit --no-fund >/dev/null 2>&1; then
+            if ${ADD_CMD:-npm install} "$SPEC" >/dev/null 2>&1 || ${ADD_CMD:-npm install} "$1" >/dev/null 2>&1; then
               ADDED="$ADDED $1"
               log "PLUGIN_AUTOINSTALL: $1 (required by detected project capabilities)"
             else
@@ -837,7 +898,7 @@ jobs:
             done
           fi
           if [ -f resources/icon.png ]; then
-            npm i -D @capacitor/assets >/dev/null 2>&1 || true
+            ${ADD_CMD:-npm install} -D @capacitor/assets >/dev/null 2>&1 || ${ADD_CMD:-npm install} @capacitor/assets >/dev/null 2>&1 || true
             npx @capacitor/assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#000000' \
               && log "[icon] Native icon/splash resources generated" \
               || log "[icon] WARNING: asset generation failed — keeping default Capacitor icon"
@@ -852,8 +913,8 @@ jobs:
             echo "CAP_SYNC_EXIT=0" >> "$GITHUB_ENV"
           else
             cat /tmp/cap-sync.log | tee -a "$REPORT"
-            log "[sync] First cap sync failed — retrying after npm install (auto-repair)"
-            npm install --no-audit --no-fund --legacy-peer-deps
+            log "REPAIR: first cap sync failed — reinstalling dependencies with ${PM:-npm} and retrying"
+            ${INSTALL_CMD:-npm install --no-audit --no-fund}
             if $CAP sync android > /tmp/cap-sync-retry.log 2>&1; then
               cat /tmp/cap-sync-retry.log | tee -a "$REPORT"
               echo "CAP_SYNC_EXIT=0-after-retry" >> "$GITHUB_ENV"
@@ -996,8 +1057,8 @@ jobs:
             MISSING="$(audit_missing)"
             log "REPAIR: plugins not registered after first sync: $MISSING — reinstalling at the Capacitor core major"
             for P in $MISSING; do
-              if [ -n "$CORE_MAJ" ]; then npm i "$P@^$CORE_MAJ" --no-audit --no-fund >/dev/null 2>&1 || npm i "$P" --no-audit --no-fund >/dev/null 2>&1 || true
-              else npm i "$P" --no-audit --no-fund >/dev/null 2>&1 || true; fi
+              if [ -n "$CORE_MAJ" ]; then ${ADD_CMD:-npm install} "$P@^$CORE_MAJ" >/dev/null 2>&1 || ${ADD_CMD:-npm install} "$P" >/dev/null 2>&1 || true
+              else ${ADD_CMD:-npm install} "$P" >/dev/null 2>&1 || true; fi
             done
             $CAP sync android > /tmp/cap-sync-repair-1.log 2>&1 || true
             tail -n 30 /tmp/cap-sync-repair-1.log || true
@@ -1229,9 +1290,9 @@ jobs:
             echo "[browser-repair] Browser plugin trace reported a gap — repairing"
             CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
             if [ -n "$CORE_MAJ" ]; then
-              npm i "@capacitor/browser@^$CORE_MAJ" --no-audit --no-fund || npm i @capacitor/browser --no-audit --no-fund || true
+              ${ADD_CMD:-npm install} "@capacitor/browser@^$CORE_MAJ" || ${ADD_CMD:-npm install} @capacitor/browser || true
             else
-              npm i @capacitor/browser --no-audit --no-fund || true
+              ${ADD_CMD:-npm install} @capacitor/browser || true
             fi
             npx cap sync android > /tmp/cap-sync-browser-repair.log 2>&1 || true
             tail -n 40 /tmp/cap-sync-browser-repair.log || true
