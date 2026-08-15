@@ -1286,7 +1286,16 @@ jobs:
 
           # Auto-repair ladder: install at the core major, re-sync, then
           # cap update, then a full native regeneration before giving up.
-          if grep -q "^BROWSER_TRACE_VERDICT: stage" browser-plugin-trace.txt 2>/dev/null; then
+          # Gated on the project actually requiring Browser — a project with
+          # no OAuth/browser signal must never have @capacitor/browser force-
+          # installed just because it wasn't declared (that would inject a
+          # plugin the app never asked for into every generated APK).
+          BROWSER_REQUIRED=""
+          case ",${APKFORGE_RUNTIME_PLUGINS:-}," in *",@capacitor/browser,"*) BROWSER_REQUIRED=1 ;; esac
+          node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['@capacitor/browser']?0:1)" 2>/dev/null && BROWSER_REQUIRED=1
+          if [ -z "$BROWSER_REQUIRED" ]; then
+            echo "[browser-repair] @capacitor/browser is not required by this project (no OAuth signal, not declared) — skipping repair" | tee -a "$REPORT"
+          elif grep -q "^BROWSER_TRACE_VERDICT: stage" browser-plugin-trace.txt 2>/dev/null; then
             echo "[browser-repair] Browser plugin trace reported a gap — repairing"
             CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
             if [ -n "$CORE_MAJ" ]; then
@@ -1316,6 +1325,393 @@ jobs:
               echo "BROWSER_TRACE_VERDICT: repaired (Browser plugin installed and registered during the build)" | tee -a "$REPORT"
             else
               echo "BROWSER_TRACE_VERDICT: unrepairable — see browser-plugin-trace.txt" | tee -a "$REPORT"
+            fi
+          fi
+          exit 0
+
+      - name: Preferences plugin forensic trace + repair (post-sync)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          cat > /tmp/apkforge-preferences-trace.sh <<'TRACEEOF'
+          #!/usr/bin/env bash
+          # Evidence-only forensic trace of @capacitor/preferences through the
+          # pipeline, mirroring the Browser trace above. Never repairs anything
+          # itself — only records what exists where.
+          PHASE="$1"
+          TRACE="preferences-plugin-trace.txt"
+          out() { echo "$1" | tee -a "$TRACE"; }
+          VERDICT=""
+          note() { [ -n "$VERDICT" ] || VERDICT="$1"; }
+
+          out "========== Preferences plugin trace ($PHASE) =========="
+          out "cwd: $(pwd)"
+
+          if [ "$PHASE" != "post-apk" ]; then
+            # 1. Declaration in package.json
+            DECL="$(node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log(d['@capacitor/preferences']||'')" 2>/dev/null)"
+            if [ -n "$DECL" ]; then
+              out "1 PASS  package.json declares @capacitor/preferences@$DECL"
+            else
+              out "1 FAIL  project/package.json does not declare @capacitor/preferences"
+              note "stage 1 — @capacitor/preferences is not declared in project/package.json, so nothing downstream can install or register it"
+            fi
+
+            # 2. Installed in node_modules
+            if [ -f node_modules/@capacitor/preferences/package.json ]; then
+              out "2 PASS  node_modules/@capacitor/preferences present, version $(node -p "require('./node_modules/@capacitor/preferences/package.json').version" 2>/dev/null)"
+            else
+              out "2 FAIL  node_modules/@capacitor/preferences/package.json does not exist"
+              note "stage 2 — @capacitor/preferences is not installed in node_modules"
+            fi
+
+            # 3. Native Android sources shipped by the plugin
+            if [ -d node_modules/@capacitor/preferences/android ]; then
+              out "3 PASS  node_modules/@capacitor/preferences/android exists"
+              find node_modules/@capacitor/preferences/android -name 'PreferencesPlugin.java' 2>/dev/null | sed 's/^/      /' | tee -a "$TRACE"
+            else
+              out "3 FAIL  node_modules/@capacitor/preferences/android is missing (no native code for cap sync to register)"
+              note "stage 3 — the installed @capacitor/preferences package ships no android/ native sources"
+            fi
+
+            # 4. cap sync evidence
+            if [ -f /tmp/cap-sync.log ] || [ -f /tmp/cap-sync-retry.log ]; then
+              out "4 INFO  cap sync exit marker: ${CAP_SYNC_EXIT:-unknown}"
+              if cat /tmp/cap-sync.log /tmp/cap-sync-retry.log 2>/dev/null | grep -qi "@capacitor/preferences"; then
+                out "4 PASS  cap sync output mentions @capacitor/preferences"
+              else
+                out "4 FAIL  cap sync output never mentions @capacitor/preferences"
+                note "stage 4 — cap sync did not see @capacitor/preferences as an installed plugin"
+              fi
+            else
+              out "4 SKIP  no cap sync log captured"
+            fi
+
+            # 5/6. capacitor.plugins.json
+            PJ="android/app/src/main/assets/capacitor.plugins.json"
+            if [ -f "$PJ" ]; then
+              out "5 PASS  $PJ exists"
+              if grep -q "PreferencesPlugin" "$PJ"; then
+                out "6 PASS  $PJ registers com.capacitorjs.plugins.preferences.PreferencesPlugin"
+              else
+                out "6 FAIL  $PJ contains no PreferencesPlugin entry"
+                note "stage 6 — capacitor.plugins.json exists but has no Preferences entry"
+              fi
+            else
+              out "5 FAIL  $PJ does not exist after cap sync"
+              note "stage 5 — capacitor.plugins.json was not generated by cap sync"
+            fi
+
+            # 7. Gradle registration
+            out "7 ----- Gradle plugin registration -----"
+            for f in android/capacitor.settings.gradle android/app/capacitor.build.gradle; do
+              if [ -f "$f" ]; then
+                HIT="$(grep -n -i "capacitor-preferences" "$f")"
+                if [ -n "$HIT" ]; then
+                  out "7 PASS  $f:"; echo "$HIT" | sed 's/^/      /' | tee -a "$TRACE"
+                else
+                  out "7 FAIL  $f has no capacitor-preferences entry"
+                  note "stage 7 — $f does not include the capacitor-preferences Gradle module"
+                fi
+              else
+                out "7 FAIL  $f is missing"
+                note "stage 7 — $f is missing from the native project"
+              fi
+            done
+
+            # 8. MainActivity — same auto-registration path as Browser
+            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            if [ -n "$MA" ]; then
+              if grep -q "extends BridgeActivity" "$MA"; then
+                out "8 PASS  MainActivity extends BridgeActivity (auto-registration path intact)"
+              else
+                out "8 FAIL  MainActivity does not extend BridgeActivity"
+                note "stage 8 — MainActivity at $MA does not extend BridgeActivity, so plugins are never auto-registered"
+              fi
+              if grep -q "registerPlugin" "$MA"; then
+                grep -q "PreferencesPlugin" "$MA" || note "stage 8 — MainActivity registers an explicit plugin list that omits PreferencesPlugin"
+              fi
+            else
+              out "8 FAIL  MainActivity.java not found under android/app/src/main/java"
+              note "stage 8 — MainActivity.java is missing from the native project"
+            fi
+          fi
+
+          if [ "$PHASE" = "post-apk" ]; then
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1)"
+            if [ -z "$APK" ]; then
+              out "9 FAIL  no release APK found under android/app/build/outputs/apk/release"
+              note "stage 9 — no release APK was produced"
+            else
+              if unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-preferences-plugins.json 2>/dev/null; then
+                out "9 PASS  assets/capacitor.plugins.json is packaged"
+                if grep -q "PreferencesPlugin" /tmp/apk-preferences-plugins.json; then
+                  out "9 PASS  packaged capacitor.plugins.json contains PreferencesPlugin"
+                else
+                  out "9 FAIL  packaged capacitor.plugins.json has no PreferencesPlugin entry"
+                  note "stage 9 — the packaged APK's capacitor.plugins.json omits Preferences"
+                fi
+              else
+                out "9 FAIL  assets/capacitor.plugins.json is not inside the APK"
+                note "stage 9 — capacitor.plugins.json was not packaged into the APK"
+              fi
+
+              # 10. Native class inside the dex — the APK is the source of truth
+              FOUND_CLASS=""
+              for DEX in $(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null); do
+                unzip -p "$APK" "$DEX" > /tmp/apkforge-prefs.dex 2>/dev/null || continue
+                if strings /tmp/apkforge-prefs.dex 2>/dev/null | grep -q "capacitorjs/plugins/preferences/PreferencesPlugin"; then
+                  FOUND_CLASS="$DEX"; break
+                fi
+              done
+              if [ -n "$FOUND_CLASS" ]; then
+                out "10 PASS  PreferencesPlugin native class found in $FOUND_CLASS"
+              else
+                out "10 FAIL  PreferencesPlugin native class is not present in any classes*.dex of the APK"
+                note "stage 10 — the Preferences native class was never compiled into the APK"
+              fi
+            fi
+          fi
+
+          if [ -n "$VERDICT" ]; then
+            out "PREFERENCES_TRACE_VERDICT: $VERDICT"
+          else
+            out "PREFERENCES_TRACE_VERDICT: present end-to-end ($PHASE)"
+          fi
+          out "========== end Preferences plugin trace ($PHASE) =========="
+          TRACEEOF
+          chmod +x /tmp/apkforge-preferences-trace.sh
+          bash /tmp/apkforge-preferences-trace.sh post-sync
+
+          # Gated exactly like Browser: only repair when the project actually
+          # requires Preferences (localStorage/sessionStorage/persist signal,
+          # a registerPlugin('Preferences') call, or an explicit dependency).
+          PREFERENCES_REQUIRED=""
+          case ",${APKFORGE_RUNTIME_PLUGINS:-}," in *",@capacitor/preferences,"*) PREFERENCES_REQUIRED=1 ;; esac
+          node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['@capacitor/preferences']?0:1)" 2>/dev/null && PREFERENCES_REQUIRED=1
+          if [ -z "$PREFERENCES_REQUIRED" ]; then
+            echo "[preferences-repair] @capacitor/preferences is not required by this project — skipping repair" | tee -a "$REPORT"
+          elif grep -q "^PREFERENCES_TRACE_VERDICT: stage" preferences-plugin-trace.txt 2>/dev/null; then
+            echo "[preferences-repair] Preferences plugin trace reported a gap — repairing"
+            CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+            if [ -n "$CORE_MAJ" ]; then
+              ${ADD_CMD:-npm install} "@capacitor/preferences@^$CORE_MAJ" || ${ADD_CMD:-npm install} @capacitor/preferences || true
+            else
+              ${ADD_CMD:-npm install} @capacitor/preferences || true
+            fi
+            npx cap sync android > /tmp/cap-sync-preferences-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-sync-preferences-repair.log || true
+            mv preferences-plugin-trace.txt preferences-plugin-trace-before-repair.txt 2>/dev/null || true
+            bash /tmp/apkforge-preferences-trace.sh post-sync-repair
+            if ! grep -q "^PREFERENCES_TRACE_VERDICT: present end-to-end" preferences-plugin-trace.txt 2>/dev/null; then
+              echo "[preferences-repair] Still missing — running cap update android"
+              npx cap update android > /tmp/cap-update-preferences-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-preferences-repair-2.log 2>&1 || true
+              bash /tmp/apkforge-preferences-trace.sh post-update-repair
+            fi
+            if ! grep -q "^PREFERENCES_TRACE_VERDICT: present end-to-end" preferences-plugin-trace.txt 2>/dev/null; then
+              echo "[preferences-repair] Still missing — regenerating the native Android project"
+              rm -rf android
+              npx cap add android > /tmp/cap-add-preferences-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-preferences-repair-3.log 2>&1 || true
+              bash /tmp/apkforge-preferences-trace.sh post-regenerate-repair
+            fi
+
+            if grep -q "^PREFERENCES_TRACE_VERDICT: present end-to-end" preferences-plugin-trace.txt 2>/dev/null; then
+              echo "PREFERENCES_TRACE_VERDICT: repaired (Preferences plugin installed and registered during the build)" | tee -a "$REPORT"
+            else
+              echo "PREFERENCES_TRACE_VERDICT: unrepairable — see preferences-plugin-trace.txt" | tee -a "$REPORT"
+            fi
+          fi
+          exit 0
+
+      - name: App plugin forensic trace + repair (post-sync)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          cat > /tmp/apkforge-app-trace.sh <<'TRACEEOF'
+          #!/usr/bin/env bash
+          # Same evidence chain as Browser/Preferences, for @capacitor/app.
+          # @capacitor/app underpins appUrlOpen/getLaunchUrl (the OAuth
+          # deep-link callback path), so this is checked on every build —
+          # it is the one plugin that is always required.
+          PHASE="$1"
+          TRACE="app-plugin-trace.txt"
+          out() { echo "$1" | tee -a "$TRACE"; }
+          VERDICT=""
+          note() { [ -n "$VERDICT" ] || VERDICT="$1"; }
+
+          out "========== App plugin trace ($PHASE) =========="
+          out "cwd: $(pwd)"
+
+          if [ "$PHASE" != "post-apk" ]; then
+            DECL="$(node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log(d['@capacitor/app']||'')" 2>/dev/null)"
+            if [ -n "$DECL" ]; then
+              out "1 PASS  package.json declares @capacitor/app@$DECL"
+            else
+              out "1 FAIL  project/package.json does not declare @capacitor/app"
+              note "stage 1 — @capacitor/app is not declared in project/package.json"
+            fi
+
+            if [ -f node_modules/@capacitor/app/package.json ]; then
+              out "2 PASS  node_modules/@capacitor/app present, version $(node -p "require('./node_modules/@capacitor/app/package.json').version" 2>/dev/null)"
+            else
+              out "2 FAIL  node_modules/@capacitor/app/package.json does not exist"
+              note "stage 2 — @capacitor/app is not installed in node_modules"
+            fi
+
+            if [ -d node_modules/@capacitor/app/android ]; then
+              out "3 PASS  node_modules/@capacitor/app/android exists"
+            else
+              out "3 FAIL  node_modules/@capacitor/app/android is missing"
+              note "stage 3 — the installed @capacitor/app package ships no android/ native sources"
+            fi
+
+            PJ="android/app/src/main/assets/capacitor.plugins.json"
+            if [ -f "$PJ" ]; then
+              out "4 PASS  $PJ exists"
+              if grep -q "AppPlugin" "$PJ"; then
+                out "5 PASS  $PJ registers com.capacitorjs.plugins.app.AppPlugin"
+              else
+                out "5 FAIL  $PJ contains no AppPlugin entry"
+                note "stage 5 — capacitor.plugins.json exists but has no App entry"
+              fi
+            else
+              out "4 FAIL  $PJ does not exist after cap sync"
+              note "stage 4 — capacitor.plugins.json was not generated by cap sync"
+            fi
+
+            out "6 ----- Gradle plugin registration -----"
+            for f in android/capacitor.settings.gradle android/app/capacitor.build.gradle; do
+              if [ -f "$f" ]; then
+                HIT="$(grep -n -i "capacitor-app" "$f")"
+                if [ -n "$HIT" ]; then
+                  out "6 PASS  $f:"; echo "$HIT" | sed 's/^/      /' | tee -a "$TRACE"
+                else
+                  out "6 FAIL  $f has no capacitor-app entry"
+                  note "stage 6 — $f does not include the capacitor-app Gradle module"
+                fi
+              else
+                out "6 FAIL  $f is missing"
+                note "stage 6 — $f is missing from the native project"
+              fi
+            done
+
+            # MainActivity + deep-link intent filter — this is the plugin
+            # that actually receives the OAuth callback via appUrlOpen/
+            # getLaunchUrl, so the intent filter is part of its contract.
+            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            if [ -n "$MA" ]; then
+              if grep -q "extends BridgeActivity" "$MA"; then
+                out "7 PASS  MainActivity extends BridgeActivity"
+              else
+                out "7 FAIL  MainActivity does not extend BridgeActivity"
+                note "stage 7 — MainActivity at $MA does not extend BridgeActivity"
+              fi
+              if grep -q "registerPlugin" "$MA"; then
+                grep -q "AppPlugin" "$MA" || note "stage 7 — MainActivity registers an explicit plugin list that omits AppPlugin"
+              fi
+            else
+              out "7 FAIL  MainActivity.java not found under android/app/src/main/java"
+              note "stage 7 — MainActivity.java is missing from the native project"
+            fi
+
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            if [ -f "$MANIFEST" ]; then
+              if grep -q "android.intent.action.VIEW" "$MANIFEST" && grep -q "android.intent.category.BROWSABLE" "$MANIFEST"; then
+                out "8 PASS  $MANIFEST has a VIEW/BROWSABLE intent filter (deep-link callback route)"
+              else
+                out "8 FAIL  $MANIFEST has no VIEW/BROWSABLE intent filter"
+                note "stage 8 — no deep-link intent filter in AndroidManifest.xml, so appUrlOpen can never fire"
+              fi
+            else
+              out "8 FAIL  $MANIFEST is missing"
+              note "stage 8 — AndroidManifest.xml is missing"
+            fi
+          fi
+
+          if [ "$PHASE" = "post-apk" ]; then
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1)"
+            if [ -z "$APK" ]; then
+              out "9 FAIL  no release APK found under android/app/build/outputs/apk/release"
+              note "stage 9 — no release APK was produced"
+            else
+              if unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-app-plugins.json 2>/dev/null && grep -q "AppPlugin" /tmp/apk-app-plugins.json; then
+                out "9 PASS  packaged capacitor.plugins.json contains AppPlugin"
+              else
+                out "9 FAIL  packaged capacitor.plugins.json omits App"
+                note "stage 9 — the packaged APK's capacitor.plugins.json omits App"
+              fi
+
+              FOUND_CLASS=""
+              for DEX in $(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null); do
+                unzip -p "$APK" "$DEX" > /tmp/apkforge-app.dex 2>/dev/null || continue
+                if strings /tmp/apkforge-app.dex 2>/dev/null | grep -q "capacitorjs/plugins/app/AppPlugin"; then
+                  FOUND_CLASS="$DEX"; break
+                fi
+              done
+              if [ -n "$FOUND_CLASS" ]; then
+                out "10 PASS  AppPlugin native class found in $FOUND_CLASS"
+              else
+                out "10 FAIL  AppPlugin native class is not present in any classes*.dex of the APK"
+                note "stage 10 — the App native class was never compiled into the APK"
+              fi
+
+              if unzip -p "$APK" AndroidManifest.xml > /tmp/apkforge-app-manifest.bin 2>/dev/null && strings /tmp/apkforge-app-manifest.bin 2>/dev/null | grep -qi "BROWSABLE"; then
+                out "11 PASS  final packaged AndroidManifest.xml retains a BROWSABLE intent filter"
+              else
+                out "11 FAIL  final packaged AndroidManifest.xml has no BROWSABLE intent filter"
+                note "stage 11 — the deep-link intent filter did not survive into the final packaged manifest"
+              fi
+            fi
+          fi
+
+          if [ -n "$VERDICT" ]; then
+            out "APP_TRACE_VERDICT: $VERDICT"
+          else
+            out "APP_TRACE_VERDICT: present end-to-end ($PHASE)"
+          fi
+          out "========== end App plugin trace ($PHASE) =========="
+          TRACEEOF
+          chmod +x /tmp/apkforge-app-trace.sh
+          bash /tmp/apkforge-app-trace.sh post-sync
+
+          # App is unconditionally required (Capacitor lifecycle + the OAuth
+          # deep-link callback path depend on it), so no gate is needed here
+          # — unlike Browser/Preferences it is always installed at the
+          # dependency stage regardless of what the project uses.
+          if grep -q "^APP_TRACE_VERDICT: stage" app-plugin-trace.txt 2>/dev/null; then
+            echo "[app-repair] App plugin trace reported a gap — repairing"
+            CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+            if [ -n "$CORE_MAJ" ]; then
+              ${ADD_CMD:-npm install} "@capacitor/app@^$CORE_MAJ" || ${ADD_CMD:-npm install} @capacitor/app || true
+            else
+              ${ADD_CMD:-npm install} @capacitor/app || true
+            fi
+            npx cap sync android > /tmp/cap-sync-app-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-sync-app-repair.log || true
+            mv app-plugin-trace.txt app-plugin-trace-before-repair.txt 2>/dev/null || true
+            bash /tmp/apkforge-app-trace.sh post-sync-repair
+            if ! grep -q "^APP_TRACE_VERDICT: present end-to-end" app-plugin-trace.txt 2>/dev/null; then
+              echo "[app-repair] Still missing — running cap update android"
+              npx cap update android > /tmp/cap-update-app-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-app-repair-2.log 2>&1 || true
+              bash /tmp/apkforge-app-trace.sh post-update-repair
+            fi
+            if ! grep -q "^APP_TRACE_VERDICT: present end-to-end" app-plugin-trace.txt 2>/dev/null; then
+              echo "[app-repair] Still missing — regenerating the native Android project"
+              rm -rf android
+              npx cap add android > /tmp/cap-add-app-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-app-repair-3.log 2>&1 || true
+              bash /tmp/apkforge-app-trace.sh post-regenerate-repair
+            fi
+
+            if grep -q "^APP_TRACE_VERDICT: present end-to-end" app-plugin-trace.txt 2>/dev/null; then
+              echo "APP_TRACE_VERDICT: repaired (App plugin installed and registered during the build)" | tee -a "$REPORT"
+            else
+              echo "APP_TRACE_VERDICT: unrepairable — see app-plugin-trace.txt" | tee -a "$REPORT"
             fi
           fi
           exit 0
@@ -1757,6 +2153,20 @@ jobs:
           fi
           log "Key password: valid"
           log "Final signing alias: $FINAL_ALIAS"
+
+          # Record the release certificate's SHA-256 fingerprint so the final
+          # APK can be checked against it after Gradle — a signature that
+          # verifies but comes from the wrong certificate (e.g. Gradle
+          # silently falling back to debug signing) must still fail the build.
+          ALIAS_OUT="$(mktemp)"
+          keytool -list -v -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -alias "$FINAL_ALIAS" > "$ALIAS_OUT" 2>&1 || true
+          CERT_SHA256="$(grep -A1 -i 'SHA256:' "$ALIAS_OUT" | grep -Eo '([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}' | tr -d ':' | tr 'A-F' 'a-f' | head -n 1)"
+          if [ -z "$CERT_SHA256" ]; then
+            fail "Could not extract the SHA-256 certificate fingerprint for alias '$FINAL_ALIAS' from the keystore. Cannot verify the final APK is signed with the expected certificate."
+          fi
+          log "Certificate SHA-256: $CERT_SHA256"
+          echo "APKFORGE_EXPECTED_CERT_SHA256=$CERT_SHA256" >> "$GITHUB_ENV"
+
           log "SIGNING_VALIDATION_PASSED"
           log "========== APKForge signing diagnostics complete =========="
           echo "APKFORGE_VALIDATED_KEY_ALIAS=$FINAL_ALIAS" >> "$GITHUB_ENV"
@@ -1819,9 +2229,30 @@ jobs:
           if [ -x "$APKSIGNER" ]; then
             "$APKSIGNER" verify --print-certs "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
             log "Signature: valid"
+
+            # A signature that merely *verifies* is not enough — Gradle must
+            # have signed with the same certificate the preflight step
+            # validated. Without this check, a silent fallback to debug
+            # signing (or the wrong keystore) would still say "signed
+            # correctly" here.
+            if [ -n "${APKFORGE_EXPECTED_CERT_SHA256:-}" ]; then
+              ACTUAL_SHA256="$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null | grep -i 'SHA-256 digest' | head -n 1 | sed -E 's/.*: *//' | tr -d ' ' | tr 'A-F' 'a-f')"
+              if [ -z "$ACTUAL_SHA256" ]; then
+                fail "Could not extract the signing certificate's SHA-256 digest from the built APK to verify it against the configured keystore."
+              fi
+              log "Expected certificate SHA-256: ${APKFORGE_EXPECTED_CERT_SHA256}"
+              log "Actual certificate SHA-256:   $ACTUAL_SHA256"
+              if [ "$ACTUAL_SHA256" != "${APKFORGE_EXPECTED_CERT_SHA256}" ]; then
+                fail "The release APK is signed with a certificate that does not match the configured keystore (expected ${APKFORGE_EXPECTED_CERT_SHA256}, got $ACTUAL_SHA256). This usually means Gradle fell back to debug signing or used a different keystore — the build must not be trusted."
+              fi
+              log "Certificate fingerprint: matches configured keystore"
+            else
+              log "::warning::No expected certificate fingerprint was recorded during signing preflight — skipping certificate-match verification."
+            fi
           else
             jarsigner -verify "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
             log "Signature: valid (jarsigner)"
+            log "::warning::apksigner unavailable — falling back to jarsigner, which cannot verify the certificate fingerprint matches the configured keystore."
           fi
 
           if [ -x "$AAPT2" ]; then
@@ -1865,6 +2296,41 @@ jobs:
             done
             [ -z "$MISSING_IN_APK" ] || fail "These Capacitor plugins are registered in the project but missing from the packaged APK's assets/capacitor.plugins.json, so they would fail at runtime with \"plugin is not implemented on android\":$MISSING_IN_APK"
             log "Packaged plugins: verified"
+
+            # capacitor.plugins.json alone is metadata, not proof the native
+            # class survived compilation/minification. For every official
+            # @capacitor/* plugin (whose class naming is predictable —
+            # com.capacitorjs.plugins.<name>.<Name>Plugin) cross-check the
+            # actual classes*.dex of the built APK. Third-party plugins don't
+            # follow a guaranteed naming convention, so they're left to the
+            # capacitor.plugins.json check above rather than guessed at.
+            DEX_LIST="$(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null)"
+            DEX_STRINGS_FILE="$(mktemp)"
+            for DEX in $DEX_LIST; do
+              unzip -p "$APK" "$DEX" 2>/dev/null | strings >> "$DEX_STRINGS_FILE"
+            done
+            DEX_CLASS_MISSING=""
+            for p in $(echo "$APKFORGE_RUNTIME_PLUGINS" | tr ',' ' '); do
+              case "$p" in
+                @capacitor/*)
+                  PNAME="${p#@capacitor/}"
+                  # e.g. @capacitor/local-notifications -> localnotifications
+                  PNAME_NORM="$(echo "$PNAME" | tr -d '-')"
+                  if grep -qi "capacitorjs/plugins/$PNAME_NORM/" "$DEX_STRINGS_FILE" 2>/dev/null || grep -qi "capacitorjs/plugins/$PNAME/" "$DEX_STRINGS_FILE" 2>/dev/null; then
+                    log "DEX class present: $p"
+                  else
+                    log "DEX class NOT FOUND: $p (checked classes*.dex for com.capacitorjs.plugins.$PNAME_NORM.*)"
+                    DEX_CLASS_MISSING="$DEX_CLASS_MISSING $p"
+                  fi
+                  ;;
+                *)
+                  log "DEX check skipped for third-party plugin (no guaranteed class naming): $p"
+                  ;;
+              esac
+            done
+            rm -f "$DEX_STRINGS_FILE"
+            [ -z "$DEX_CLASS_MISSING" ] || fail "These official Capacitor plugins are registered in capacitor.plugins.json but their compiled native class was not found in the APK's classes*.dex — they would fail at runtime with \"plugin is not implemented on android\" even though the registration looked correct:$DEX_CLASS_MISSING"
+            log "DEX-level plugin verification: passed"
           else
             log "No Capacitor plugins declared — skipping packaged plugin check"
           fi
@@ -1879,6 +2345,30 @@ jobs:
             bash /tmp/apkforge-browser-trace.sh post-apk
           else
             echo "Browser plugin trace script unavailable (pipeline failed before sync)."
+          fi
+          exit 0
+
+      - name: Preferences plugin forensic trace (post-APK)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          if [ -f /tmp/apkforge-preferences-trace.sh ]; then
+            bash /tmp/apkforge-preferences-trace.sh post-apk
+          else
+            echo "Preferences plugin trace script unavailable (pipeline failed before sync)."
+          fi
+          exit 0
+
+      - name: App plugin forensic trace (post-APK)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          if [ -f /tmp/apkforge-app-trace.sh ]; then
+            bash /tmp/apkforge-app-trace.sh post-apk
+          else
+            echo "App plugin trace script unavailable (pipeline failed before sync)."
           fi
           exit 0
 
@@ -1923,6 +2413,10 @@ jobs:
             [ -f android-apk-verification.txt ] && cat android-apk-verification.txt
             echo
             [ -f browser-plugin-trace.txt ] && cat browser-plugin-trace.txt
+            echo
+            [ -f preferences-plugin-trace.txt ] && cat preferences-plugin-trace.txt
+            echo
+            [ -f app-plugin-trace.txt ] && cat app-plugin-trace.txt
 
           } > "$FINAL" 2>&1
           cat "$FINAL"
@@ -1939,6 +2433,8 @@ jobs:
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
             project/browser-plugin-trace.txt
+            project/preferences-plugin-trace.txt
+            project/app-plugin-trace.txt
           if-no-files-found: error
       - name: Upload AAB
         if: success() || failure()
@@ -1958,6 +2454,8 @@ jobs:
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
             project/browser-plugin-trace.txt
+            project/preferences-plugin-trace.txt
+            project/app-plugin-trace.txt
           if-no-files-found: ignore
 
       - name: Finalize APKForge build
