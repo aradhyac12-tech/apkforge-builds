@@ -42,6 +42,15 @@ jobs:
           curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
           mkdir -p project
           unzip -q source.zip -d project
+          # Defense in depth: the website already refuses to package any zip
+          # entry containing path traversal, an absolute path, or a symlink
+          # (see validate-zip.ts) — but if a source zip ever reaches this
+          # runner some other way, never trust it blindly. Modern "unzip"
+          # already refuses ../ and absolute paths by default; explicitly
+          # strip any symlink that still made it through, since a symlink
+          # pointing outside project/ combined with a later write through it
+          # is the classic zip-slip bypass that plain path-traversal checks miss.
+          find project -type l -print -delete | sed 's/^/[security] removed unexpected symlink: /'
           # If the zip wrapped everything in a single folder, flatten it.
           cd project
           if [ ! -f package.json ] && [ "$(ls -1 | wc -l)" = "1" ] && [ -d "$(ls -1)" ]; then
@@ -2171,10 +2180,142 @@ jobs:
           log "========== APKForge signing diagnostics complete =========="
           echo "APKFORGE_VALIDATED_KEY_ALIAS=$FINAL_ALIAS" >> "$GITHUB_ENV"
 
+      - name: Configure explicit Gradle release signing
+        working-directory: project/android
+        run: |
+          set -e
+          REPORT_S="../android-signing-diagnostics.txt"
+          log() { echo "$1" | tee -a "$REPORT_S"; }
+          fail() { log "SIGNING_CONFIG_FAILED: $1"; echo "::error::$1"; exit 1; }
+
+          # -Pandroid.injected.signing.* alone is not a reliable signing
+          # mechanism for a plain "./gradlew assembleRelease" invocation —
+          # those properties are consumed by Android Studio's own "Generate
+          # Signed Bundle/APK" flow, not guaranteed to attach to a normal
+          # command-line release build. Relying on it alone is the actual
+          # root cause of intermittent unsigned/unreliable release APKs.
+          # Patch an explicit signingConfigs block into the app module's
+          # build file instead — reading secret values from environment
+          # variables at Gradle-evaluation time, never writing them to disk.
+          GRADLE_FILE=""
+          GRADLE_KIND=""
+          if [ -f app/build.gradle.kts ]; then
+            GRADLE_FILE="app/build.gradle.kts"; GRADLE_KIND="kts"
+          elif [ -f app/build.gradle ]; then
+            GRADLE_FILE="app/build.gradle"; GRADLE_KIND="groovy"
+          else
+            fail "Neither app/build.gradle nor app/build.gradle.kts exists — cannot configure release signing."
+          fi
+          log "[signing-config] Patching $GRADLE_FILE ($GRADLE_KIND)"
+          cp "$GRADLE_FILE" "$GRADLE_FILE.apkforge.bak"
+          export GRADLE_FILE GRADLE_KIND
+
+          node <<'NODEEOF'
+          const fs = require('fs');
+          const kind = process.env.GRADLE_KIND;
+          const file = process.env.GRADLE_FILE;
+          let src = fs.readFileSync(file, 'utf8');
+
+          const alreadyPatched = src.includes('APKFORGE_MANAGED_SIGNING_CONFIG');
+
+          if (kind === 'groovy') {
+            const signingBlock = [
+              '',
+              '    signingConfigs {',
+              '        release {',
+              '            // APKFORGE_MANAGED_SIGNING_CONFIG -- generated at build time, values',
+              '            // come from environment variables, never written to disk as literals.',
+              '            storeFile file(System.getenv("APKFORGE_KS_FILE"))',
+              '            storePassword System.getenv("APKFORGE_KS_PASSWORD")',
+              '            keyAlias System.getenv("APKFORGE_KEY_ALIAS")',
+              '            keyPassword System.getenv("APKFORGE_KEY_PASSWORD")',
+              '        }',
+              '    }',
+              '',
+            ].join('
+');
+            if (!alreadyPatched) {
+              const androidBlockMatch = src.match(/androids*{/);
+              if (!androidBlockMatch) throw new Error('Could not find an android {} block in ' + file);
+              const insertAt = androidBlockMatch.index + androidBlockMatch[0].length;
+              src = src.slice(0, insertAt) + signingBlock + src.slice(insertAt);
+            }
+
+            if (/buildTypess*{[sS]*?releases*{[sS]*?signingConfigs+signingConfigs.release/.test(src)) {
+              // already wired
+            } else {
+              const buildTypesMatch = src.match(/buildTypess*{/);
+              if (!buildTypesMatch) throw new Error('Could not find a buildTypes {} block in ' + file);
+              const buildTypesStart = buildTypesMatch.index + buildTypesMatch[0].length;
+              // Search for the release block ONLY from here on — searching the
+              // whole file would match the signingConfigs.release block just
+              // inserted above instead of buildTypes.release.
+              const afterBuildTypes = src.slice(buildTypesStart);
+              const releaseMatch = afterBuildTypes.match(/releases*{/);
+              if (!releaseMatch) throw new Error('Could not find a release {} build type block inside buildTypes {} in ' + file);
+              const releaseInsertAt = buildTypesStart + releaseMatch.index + releaseMatch[0].length;
+              src = src.slice(0, releaseInsertAt) + '
+            signingConfig signingConfigs.release' + src.slice(releaseInsertAt);
+            }
+          } else {
+            const signingBlock = [
+              '',
+              '    signingConfigs {',
+              '        create("release") {',
+              '            // APKFORGE_MANAGED_SIGNING_CONFIG -- generated at build time, values',
+              '            // come from environment variables, never written to disk as literals.',
+              '            storeFile = file(System.getenv("APKFORGE_KS_FILE")!!)',
+              '            storePassword = System.getenv("APKFORGE_KS_PASSWORD")',
+              '            keyAlias = System.getenv("APKFORGE_KEY_ALIAS")',
+              '            keyPassword = System.getenv("APKFORGE_KEY_PASSWORD")',
+              '        }',
+              '    }',
+              '',
+            ].join('
+');
+            if (!alreadyPatched) {
+              const androidBlockMatch = src.match(/androids*{/);
+              if (!androidBlockMatch) throw new Error('Could not find an android {} block in ' + file);
+              const insertAt = androidBlockMatch.index + androidBlockMatch[0].length;
+              src = src.slice(0, insertAt) + signingBlock + src.slice(insertAt);
+            }
+
+            if (/getByName("release")[sS]*?signingConfigs*=s*signingConfigs.getByName("release")/.test(src)) {
+              // already wired
+            } else {
+              const buildTypesMatch = src.match(/buildTypess*{/);
+              if (!buildTypesMatch) throw new Error('Could not find a buildTypes {} block in ' + file);
+              const buildTypesStart = buildTypesMatch.index + buildTypesMatch[0].length;
+              const afterBuildTypes = src.slice(buildTypesStart);
+              // Search only from buildTypes onward, same reasoning as the
+              // Groovy branch — must not match the signingConfigs.create(...)
+              // block just inserted above.
+              let releaseMatch = afterBuildTypes.match(/getByName("release")s*{/);
+              let insertText = '
+            signingConfig = signingConfigs.getByName("release")';
+              if (!releaseMatch) releaseMatch = afterBuildTypes.match(/releases*{/);
+              if (!releaseMatch) throw new Error('Could not find a release build type block inside buildTypes {} in ' + file);
+              const releaseInsertAt = buildTypesStart + releaseMatch.index + releaseMatch[0].length;
+              src = src.slice(0, releaseInsertAt) + insertText + src.slice(releaseInsertAt);
+            }
+          }
+
+          fs.writeFileSync(file, src);
+          console.log('[signing-config] patched ' + file);
+          NODEEOF
+
+          if ! grep -q "APKFORGE_MANAGED_SIGNING_CONFIG" "$GRADLE_FILE"; then
+            fail "Failed to patch an explicit signingConfigs block into $GRADLE_FILE — release build would be unsigned or fall back to debug signing."
+          fi
+          log "[signing-config] Explicit release signingConfig attached in $GRADLE_FILE"
+          echo "SIGNING_CONFIG_ATTACHED: yes" | tee -a "$REPORT_S"
+
       - name: Gradle build
         working-directory: project/android
         env:
           GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
+          APKFORGE_KS_PASSWORD: ${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}
+          APKFORGE_KEY_PASSWORD: ${{ secrets.APKFORGE_KEY_PASSWORD }}
         run: |
           set -e
           # Gradle wrapper preflight (toolchain verification, part 2) — repair first.
@@ -2193,9 +2334,17 @@ jobs:
           ./gradlew --version | sed -n '1,8p' | tee -a "$REPORT"
 
           ./gradlew --no-daemon clean
+          export APKFORGE_KS_FILE="${{ github.workspace }}/project/android/app/release.keystore"
+          export APKFORGE_KEY_ALIAS="$APKFORGE_VALIDATED_KEY_ALIAS"
+          # The explicit signingConfigs block patched into build.gradle above
+          # reads APKFORGE_KS_FILE / APKFORGE_KS_PASSWORD / APKFORGE_KEY_ALIAS /
+          # APKFORGE_KEY_PASSWORD directly via System.getenv(...) — that is now
+          # the real signing mechanism. The -Pandroid.injected.signing.* flags
+          # are kept as a harmless redundant fallback only; they are not relied
+          # upon.
           KS_PASS="${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}"
           KEY_PASS="${{ secrets.APKFORGE_KEY_PASSWORD }}"
-          KS_FILE="${{ github.workspace }}/project/android/app/release.keystore"
+          KS_FILE="$APKFORGE_KS_FILE"
           gradle_release() {
             ./gradlew --no-daemon "$1" \
               -Pandroid.injected.signing.store.file="$KS_FILE" \
