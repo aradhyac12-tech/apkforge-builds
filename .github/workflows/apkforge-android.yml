@@ -3,17 +3,17 @@ run-name: "APKForge Android · ${{ inputs.build_id }}"
 on:
   workflow_dispatch:
     inputs:
-      build_id: { description: APKForge build id, required: true }
-      source_url: { description: Signed URL to source zip, required: true }
-      project_kind: { description: capacitor-full | capacitor-partial | web-app, required: true }
-      app_name: { description: App display name, required: false, default: "App" }
-      bundle_id: { description: Reverse-DNS bundle id, required: true }
-      web_dir: { description: Web build output directory, required: false, default: "www" }
-      logo_url: { description: Optional signed URL to a square app icon (PNG), required: false, default: "" }
-      node_version: { description: Project web-build Node.js major version (20-24), required: false, default: "22" }
-      finalize_endpoint: { description: APKForge backend finalization endpoint, required: false, default: "" }
-      diagnostic_endpoint: { description: APKForge sanitized runtime diagnostics endpoint, required: false, default: "" }
-      diagnostic_token: { description: APKForge per-build diagnostics token, required: false, default: "" }
+      build_id: { description: "APKForge build id", required: true }
+      source_url: { description: "Signed URL to source zip", required: true }
+      project_kind: { description: "capacitor-full | capacitor-partial | web-app", required: true }
+      app_name: { description: "App display name", required: false, default: "App" }
+      bundle_id: { description: "Reverse-DNS bundle id", required: true }
+      web_dir: { description: "Web build output directory", required: false, default: "www" }
+      logo_url: { description: "Optional signed URL to a square app icon (PNG)", required: false, default: "" }
+      node_version: { description: "Project web-build Node.js major version (20-24)", required: false, default: "22" }
+      finalize_endpoint: { description: "APKForge backend finalization endpoint", required: false, default: "" }
+      diagnostic_endpoint: { description: "APKForge sanitized runtime diagnostics endpoint", required: false, default: "" }
+      diagnostic_token: { description: "APKForge per-build diagnostics token", required: false, default: "" }
 
 jobs:
   build:
