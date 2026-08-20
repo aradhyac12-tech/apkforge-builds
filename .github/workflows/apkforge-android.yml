@@ -2329,9 +2329,16 @@ jobs:
           chmod +x ./gradlew
           ./gradlew --version | sed -n '1,8p' | tee -a "$REPORT"
 
-          ./gradlew --no-daemon clean
+          # Gradle evaluates app/build.gradle before running every task,
+          # including the clean task. Export signing inputs before the first Gradle
+          # task so storeFile never receives null during configuration.
           export APKFORGE_KS_FILE="${{ github.workspace }}/project/android/app/release.keystore"
           export APKFORGE_KEY_ALIAS="$APKFORGE_VALIDATED_KEY_ALIAS"
+          [ -f "$APKFORGE_KS_FILE" ] || { echo "PREBUILD_VALIDATION_FAILED: SIGNING_CONFIG_FAILED: release keystore is missing at $APKFORGE_KS_FILE." | tee -a "$REPORT"; exit 1; }
+          [ -n "$APKFORGE_KS_PASSWORD" ] || { echo "PREBUILD_VALIDATION_FAILED: SIGNING_CONFIG_FAILED: keystore password is unavailable." | tee -a "$REPORT"; exit 1; }
+          [ -n "$APKFORGE_KEY_ALIAS" ] || { echo "PREBUILD_VALIDATION_FAILED: SIGNING_CONFIG_FAILED: validated key alias is unavailable." | tee -a "$REPORT"; exit 1; }
+          [ -n "$APKFORGE_KEY_PASSWORD" ] || { echo "PREBUILD_VALIDATION_FAILED: SIGNING_CONFIG_FAILED: key password is unavailable." | tee -a "$REPORT"; exit 1; }
+          ./gradlew --no-daemon clean
           # The explicit signingConfigs block patched into build.gradle above
           # reads APKFORGE_KS_FILE / APKFORGE_KS_PASSWORD / APKFORGE_KEY_ALIAS /
           # APKFORGE_KEY_PASSWORD directly via System.getenv(...) — that is now
