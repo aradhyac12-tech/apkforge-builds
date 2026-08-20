@@ -598,7 +598,7 @@ jobs:
               var originalFetch = window.fetch;
               window.fetch = function (input, init) {
                 var url = typeof input === 'string' ? input : input && input.url;
-                var isToken = //auth/v1/token/i.test(String(url || ''));
+                var isToken = /\/auth\/v1\/token/i.test(String(url || ''));
                 if (isToken) send('exchangeCodeForSession-fetch-start', { endpoint: cleanUrl(url), method: (init && init.method) || 'POST' });
                 return originalFetch.apply(this, arguments).then(function (response) {
                   if (isToken) send('exchangeCodeForSession-fetch-done', { status: response.status, ok: response.ok });
@@ -2232,30 +2232,28 @@ jobs:
               '        }',
               '    }',
               '',
-            ].join('
-');
+            ].join('\n');
             if (!alreadyPatched) {
-              const androidBlockMatch = src.match(/androids*{/);
+              const androidBlockMatch = src.match(/android\s*\{/);
               if (!androidBlockMatch) throw new Error('Could not find an android {} block in ' + file);
               const insertAt = androidBlockMatch.index + androidBlockMatch[0].length;
               src = src.slice(0, insertAt) + signingBlock + src.slice(insertAt);
             }
 
-            if (/buildTypess*{[sS]*?releases*{[sS]*?signingConfigs+signingConfigs.release/.test(src)) {
+            if (/buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?signingConfig\s+signingConfigs\.release/.test(src)) {
               // already wired
             } else {
-              const buildTypesMatch = src.match(/buildTypess*{/);
+              const buildTypesMatch = src.match(/buildTypes\s*\{/);
               if (!buildTypesMatch) throw new Error('Could not find a buildTypes {} block in ' + file);
               const buildTypesStart = buildTypesMatch.index + buildTypesMatch[0].length;
               // Search for the release block ONLY from here on — searching the
               // whole file would match the signingConfigs.release block just
               // inserted above instead of buildTypes.release.
               const afterBuildTypes = src.slice(buildTypesStart);
-              const releaseMatch = afterBuildTypes.match(/releases*{/);
+              const releaseMatch = afterBuildTypes.match(/release\s*\{/);
               if (!releaseMatch) throw new Error('Could not find a release {} build type block inside buildTypes {} in ' + file);
               const releaseInsertAt = buildTypesStart + releaseMatch.index + releaseMatch[0].length;
-              src = src.slice(0, releaseInsertAt) + '
-            signingConfig signingConfigs.release' + src.slice(releaseInsertAt);
+              src = src.slice(0, releaseInsertAt) + '\n            signingConfig signingConfigs.release' + src.slice(releaseInsertAt);
             }
           } else {
             const signingBlock = [
@@ -2271,29 +2269,27 @@ jobs:
               '        }',
               '    }',
               '',
-            ].join('
-');
+            ].join('\n');
             if (!alreadyPatched) {
-              const androidBlockMatch = src.match(/androids*{/);
+              const androidBlockMatch = src.match(/android\s*\{/);
               if (!androidBlockMatch) throw new Error('Could not find an android {} block in ' + file);
               const insertAt = androidBlockMatch.index + androidBlockMatch[0].length;
               src = src.slice(0, insertAt) + signingBlock + src.slice(insertAt);
             }
 
-            if (/getByName("release")[sS]*?signingConfigs*=s*signingConfigs.getByName("release")/.test(src)) {
+            if (/getByName\("release"\)[\s\S]*?signingConfig\s*=\s*signingConfigs\.getByName\("release"\)/.test(src)) {
               // already wired
             } else {
-              const buildTypesMatch = src.match(/buildTypess*{/);
+              const buildTypesMatch = src.match(/buildTypes\s*\{/);
               if (!buildTypesMatch) throw new Error('Could not find a buildTypes {} block in ' + file);
               const buildTypesStart = buildTypesMatch.index + buildTypesMatch[0].length;
               const afterBuildTypes = src.slice(buildTypesStart);
               // Search only from buildTypes onward, same reasoning as the
               // Groovy branch — must not match the signingConfigs.create(...)
               // block just inserted above.
-              let releaseMatch = afterBuildTypes.match(/getByName("release")s*{/);
-              let insertText = '
-            signingConfig = signingConfigs.getByName("release")';
-              if (!releaseMatch) releaseMatch = afterBuildTypes.match(/releases*{/);
+              let releaseMatch = afterBuildTypes.match(/getByName\("release"\)\s*\{/);
+              let insertText = '\n            signingConfig = signingConfigs.getByName("release")';
+              if (!releaseMatch) releaseMatch = afterBuildTypes.match(/release\s*\{/);
               if (!releaseMatch) throw new Error('Could not find a release build type block inside buildTypes {} in ' + file);
               const releaseInsertAt = buildTypesStart + releaseMatch.index + releaseMatch[0].length;
               src = src.slice(0, releaseInsertAt) + insertText + src.slice(releaseInsertAt);
