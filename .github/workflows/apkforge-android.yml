@@ -14,6 +14,9 @@ on:
       finalize_endpoint: { description: "APKForge backend finalization endpoint", required: false, default: "" }
       diagnostic_endpoint: { description: "APKForge sanitized runtime diagnostics endpoint", required: false, default: "" }
       diagnostic_token: { description: "APKForge per-build diagnostics token", required: false, default: "" }
+      package_manager: { description: "Package manager decided by APKForge preflight (npm|pnpm|yarn|bun)", required: false, default: "" }
+      install_command: { description: "Install command decided by APKForge preflight", required: false, default: "" }
+      build_command: { description: "Web build command decided by APKForge preflight", required: false, default: "" }
 
 jobs:
   build:
@@ -96,6 +99,14 @@ jobs:
           # packageManager wins; otherwise the lockfile decides. When several
           # lockfiles exist without packageManager we pick one deterministically
           # (bun > pnpm > yarn > npm) and say so loudly — we never mix managers.
+          # APKForge preflight already inspected this exact archive in the
+          # browser and committed to a package manager. When it sends one, it
+          # is authoritative: the runner must not silently pick a different
+          # manager than the one the user was shown and approved.
+          PM_PREFLIGHT="${{ inputs.package_manager }}"
+          INSTALL_PREFLIGHT="${{ inputs.install_command }}"
+          BUILD_PREFLIGHT="${{ inputs.build_command }}"
+
           PM_FIELD="$(node -e "try{console.log(require('./package.json').packageManager||'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
           LOCKS=""
           if [ -f bun.lockb ] || [ -f bun.lock ]; then LOCKS="$LOCKS bun"; fi
@@ -120,6 +131,12 @@ jobs:
               log "[detect] Deterministically selecting \"$PM\". Add a packageManager field to package.json to make this explicit."
             fi
           fi
+          if [ -n "$PM_PREFLIGHT" ]; then
+            if [ "$PM_PREFLIGHT" != "$PM" ]; then
+              log "[detect] Preflight selected "$PM_PREFLIGHT" (runner detection said "$PM") — using the preflight decision."
+            fi
+            PM="$PM_PREFLIGHT"
+          fi
           case "$PM" in
             bun)
               command -v bun >/dev/null 2>&1 || curl -fsSL https://bun.sh/install | bash
@@ -137,6 +154,13 @@ jobs:
               PM="npm"
               INSTALL_CMD="npm install --no-audit --no-fund"; ADD_CMD="npm install --no-audit --no-fund"; RUN_CMD="npm run"; EXEC_CMD="npx" ;;
           esac
+          # A committed lockfile means the install can be reproducible; honour
+          # it rather than letting the resolver drift to newer transitive
+          # versions than the ones the project was tested against.
+          if [ -n "$INSTALL_PREFLIGHT" ]; then
+            INSTALL_CMD="$INSTALL_PREFLIGHT"
+            log "[detect] Install command from preflight: $INSTALL_CMD"
+          fi
           log "[detect] Package manager: $PM (lockfiles:${LOCKS:- none})"
 
           FRAMEWORK="$(node -e "
@@ -174,6 +198,7 @@ jobs:
             echo "ADD_CMD=$ADD_CMD"
             echo "RUN_CMD=$RUN_CMD"
             echo "EXEC_CMD=$EXEC_CMD"
+            echo "BUILD_CMD=$BUILD_PREFLIGHT"
             echo "DETECTED_FRAMEWORK=$FRAMEWORK"
           } >> "$GITHUB_ENV"
 
@@ -450,11 +475,16 @@ jobs:
             for stale in dist build out .output .nuxt .svelte-kit/output; do
               if [ -d "$stale" ]; then rm -rf "$stale"; log "[web] Cleaned stale output: $stale"; fi
             done
-            if $RUN_CMD build; then
+            # Preflight decided the build command from the same package.json the
+            # user saw; fall back to the manager's default only when it sent none.
+            WEB_BUILD_CMD="${BUILD_CMD:-}"
+            [ -n "$WEB_BUILD_CMD" ] || WEB_BUILD_CMD="$RUN_CMD build"
+            log "[web] Build command: $WEB_BUILD_CMD"
+            if sh -c "$WEB_BUILD_CMD"; then
               log "[web] Build script completed"
             else
               log "PREBUILD_VALIDATION_FAILED: WEB_BUILD_FAILED"
-              log "  Command: ${RUN_CMD:-npm run} build"
+              log "  Command: $WEB_BUILD_CMD"
               log "  Package manager: ${PM:-npm}   Node: $(node --version)"
               echo "::error::The project's web build script failed. Stale web assets are never reused — fix the build script and retry."
               exit 1
