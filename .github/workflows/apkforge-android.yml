@@ -2533,25 +2533,35 @@ jobs:
             log "AAB: not produced (see android-aab-status.txt) — the APK is unaffected."
           else
             log "AAB: $AAB ($(wc -c < "$AAB") bytes)"
-            if [ -x "$APKSIGNER" ]; then
-              # apksigner verifies .aab jar signatures too; a bundle signed with
-              # anything other than the validated keystore must fail the build,
-              # because Play would reject or mis-attribute it.
-              "$APKSIGNER" verify --print-certs --min-sdk-version 21 "$AAB" > /tmp/aab-certs.txt 2>&1 || {
-                cat /tmp/aab-certs.txt | tee -a "$VERIFY"
+            # An .aab is NOT an APK: apksigner requires AndroidManifest.xml at the
+            # zip root and always fails with "Missing AndroidManifest.xml" on a
+            # bundle. Bundles carry a JAR (v1) signature, so verify with jarsigner
+            # and read the signer certificate with keytool -printcert -jarfile.
+            if command -v jarsigner >/dev/null 2>&1; then
+              jarsigner -verify -strict "$AAB" > /tmp/aab-verify.txt 2>&1 || {
+                cat /tmp/aab-verify.txt | tee -a "$VERIFY"
                 fail "The release App Bundle is not correctly signed."
               }
-              cat /tmp/aab-certs.txt | tee -a "$VERIFY"
-              if [ -n "${APKFORGE_EXPECTED_CERT_SHA256:-}" ]; then
-                AAB_SHA256="$(grep -i 'SHA-256 digest' /tmp/aab-certs.txt | head -n 1 | sed -E 's/.*: *//' | tr -d ' ' | tr 'A-F' 'a-f')"
-                if [ -n "$AAB_SHA256" ] && [ "$AAB_SHA256" != "${APKFORGE_EXPECTED_CERT_SHA256}" ]; then
-                  fail "The release App Bundle is signed with a certificate that does not match the configured keystore (expected ${APKFORGE_EXPECTED_CERT_SHA256}, got $AAB_SHA256)."
+              cat /tmp/aab-verify.txt | tee -a "$VERIFY"
+              if command -v keytool >/dev/null 2>&1; then
+                keytool -printcert -jarfile "$AAB" > /tmp/aab-certs.txt 2>&1 || true
+                cat /tmp/aab-certs.txt | tee -a "$VERIFY"
+                if [ -n "${APKFORGE_EXPECTED_CERT_SHA256:-}" ]; then
+                  AAB_SHA256="$(grep -i 'SHA256:' /tmp/aab-certs.txt | head -n 1 | sed -E 's/.*SHA256: *//' | tr -d ' :' | tr 'A-F' 'a-f')"
+                  if [ -n "$AAB_SHA256" ] && [ "$AAB_SHA256" != "${APKFORGE_EXPECTED_CERT_SHA256}" ]; then
+                    fail "The release App Bundle is signed with a certificate that does not match the configured keystore (expected ${APKFORGE_EXPECTED_CERT_SHA256}, got $AAB_SHA256)."
+                  fi
+                  if [ -n "$AAB_SHA256" ]; then
+                    log "AAB certificate fingerprint: matches configured keystore"
+                  else
+                    log "::warning::Could not read the App Bundle certificate fingerprint; signature itself verified."
+                  fi
                 fi
-                log "AAB certificate fingerprint: matches configured keystore"
               fi
             else
-              log "::warning::apksigner unavailable — App Bundle signature was not verified."
+              log "::warning::jarsigner unavailable — App Bundle signature was not verified."
             fi
+
             log "AAB_VERIFICATION_PASSED"
           fi
 
