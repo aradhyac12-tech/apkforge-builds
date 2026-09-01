@@ -2386,7 +2386,16 @@ jobs:
               -Pandroid.injected.signing.key.password="$KEY_PASS"
           }
           gradle_release assembleRelease
-          gradle_release bundleRelease || echo "::warning::AAB (bundleRelease) could not be produced; APK is unaffected."
+          # The bundle is best effort: a project that cannot produce an .aab
+          # must not fail an otherwise good APK build. The outcome is recorded
+          # so the app can explain the missing bundle instead of hiding it.
+          if gradle_release bundleRelease > /tmp/apkforge-bundle.log 2>&1; then
+            echo "AAB_STATUS: produced" | tee android-aab-status.txt
+          else
+            echo "AAB_STATUS: bundleRelease failed" | tee android-aab-status.txt
+            tail -n 60 /tmp/apkforge-bundle.log | tee -a android-aab-status.txt
+            echo "::warning::AAB (bundleRelease) could not be produced; APK is unaffected."
+          fi
 
 
 
@@ -2518,6 +2527,36 @@ jobs:
           fi
           log "APK_VERIFICATION_PASSED"
 
+          # ----- App Bundle (.aab) -----
+          AAB="$(find android/app/build/outputs/bundle/release -name '*.aab' 2>/dev/null | head -n 1 || true)"
+          if [ -z "$AAB" ]; then
+            log "AAB: not produced (see android-aab-status.txt) — the APK is unaffected."
+          else
+            log "AAB: $AAB ($(wc -c < "$AAB") bytes)"
+            if [ -x "$APKSIGNER" ]; then
+              # apksigner verifies .aab jar signatures too; a bundle signed with
+              # anything other than the validated keystore must fail the build,
+              # because Play would reject or mis-attribute it.
+              "$APKSIGNER" verify --print-certs --min-sdk-version 21 "$AAB" > /tmp/aab-certs.txt 2>&1 || {
+                cat /tmp/aab-certs.txt | tee -a "$VERIFY"
+                fail "The release App Bundle is not correctly signed."
+              }
+              cat /tmp/aab-certs.txt | tee -a "$VERIFY"
+              if [ -n "${APKFORGE_EXPECTED_CERT_SHA256:-}" ]; then
+                AAB_SHA256="$(grep -i 'SHA-256 digest' /tmp/aab-certs.txt | head -n 1 | sed -E 's/.*: *//' | tr -d ' ' | tr 'A-F' 'a-f')"
+                if [ -n "$AAB_SHA256" ] && [ "$AAB_SHA256" != "${APKFORGE_EXPECTED_CERT_SHA256}" ]; then
+                  fail "The release App Bundle is signed with a certificate that does not match the configured keystore (expected ${APKFORGE_EXPECTED_CERT_SHA256}, got $AAB_SHA256)."
+                fi
+                log "AAB certificate fingerprint: matches configured keystore"
+              fi
+            else
+              log "::warning::apksigner unavailable — App Bundle signature was not verified."
+            fi
+            log "AAB_VERIFICATION_PASSED"
+          fi
+
+
+
       - name: Browser plugin forensic trace (post-APK)
         if: success() || failure()
         working-directory: project
@@ -2594,6 +2633,8 @@ jobs:
             echo
             [ -f android-apk-verification.txt ] && cat android-apk-verification.txt
             echo
+            [ -f android-aab-status.txt ] && cat android-aab-status.txt
+            echo
             [ -f browser-plugin-trace.txt ] && cat browser-plugin-trace.txt
             echo
             [ -f preferences-plugin-trace.txt ] && cat preferences-plugin-trace.txt
@@ -2614,6 +2655,7 @@ jobs:
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
+            project/android-aab-status.txt
             project/browser-plugin-trace.txt
             project/preferences-plugin-trace.txt
             project/app-plugin-trace.txt
@@ -2635,6 +2677,7 @@ jobs:
             project/android-prebuild-report.txt
             project/android-signing-diagnostics.txt
             project/android-apk-verification.txt
+            project/android-aab-status.txt
             project/browser-plugin-trace.txt
             project/preferences-plugin-trace.txt
             project/app-plugin-trace.txt
