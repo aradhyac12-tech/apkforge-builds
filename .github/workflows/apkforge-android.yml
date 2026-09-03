@@ -767,6 +767,7 @@ jobs:
         run: |
           set -e
           log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
           CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}")"
 
           # Signals are collected once from the project sources + package.json.
@@ -888,6 +889,32 @@ jobs:
           if [ -z "$ADDED" ]; then log "[plugins] No additional Capacitor plugins required"; fi
           log "[plugins] Auto-installed:${ADDED:- none}"
           echo "APKFORGE_AUTO_PLUGINS=$(echo $ADDED | tr ' ' ',')" >> "$GITHUB_ENV"
+
+          # ---- Hard requirement set -------------------------------------
+          # Every @capacitor/* plugin the app actually *calls* — because the
+          # source imports it, or because the shipped bundle still contains
+          # registerPlugin('<Name>') — must end up natively registered. This
+          # list is carried through the rest of the build as a gate: a plugin
+          # in it that is not wired into capacitor.settings.gradle /
+          # capacitor.plugins.json / the packaged APK fails the build instead
+          # of shipping an APK that answers isPluginAvailable() with false.
+          REQUIRED=""
+          for PKG in $(grep -oE '@capacitor/[a-z-]+' "$SRC_HITS" 2>/dev/null | sort -u); do
+            case "$PKG" in
+              @capacitor/core|@capacitor/cli|@capacitor/android|@capacitor/ios|@capacitor/assets) continue ;;
+            esac
+            # Only count packages that are installed as real native plugins or
+            # that we just installed — an unresolvable name must be reported,
+            # not silently dropped.
+            if [ -d "node_modules/$PKG" ] || case " $ADDED " in *" $PKG "*) true ;; *) false ;; esac; then
+              REQUIRED="$REQUIRED,$PKG"
+            else
+              fail "The app calls $PKG at runtime but the package could not be installed on the runner, so the native plugin can never be registered. Add $PKG to package.json dependencies (matching your Capacitor major version) and rebuild."
+            fi
+          done
+          REQUIRED="$(echo "$REQUIRED" | sed 's/^,//')"
+          log "[plugins] Plugins the app calls and that MUST be natively registered: ${REQUIRED:-none}"
+          echo "APKFORGE_REQUIRED_PLUGINS=$REQUIRED" >> "$GITHUB_ENV"
 
       - name: Generate or repair native Android project
         working-directory: project
@@ -1529,6 +1556,13 @@ jobs:
           PREFERENCES_REQUIRED=""
           case ",${APKFORGE_RUNTIME_PLUGINS:-}," in *",@capacitor/preferences,"*) PREFERENCES_REQUIRED=1 ;; esac
           node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['@capacitor/preferences']?0:1)" 2>/dev/null && PREFERENCES_REQUIRED=1
+          # APKFORGE_RUNTIME_PLUGINS only lists plugins already installed, so it
+          # cannot see the case that actually breaks Android: the shipped bundle
+          # calls registerPlugin('Preferences') but the package was never
+          # installed. Those two signals make the requirement authoritative.
+          case ",${APKFORGE_REQUIRED_PLUGINS:-}," in *",@capacitor/preferences,"*) PREFERENCES_REQUIRED=1 ;; esac
+          grep -qx "Preferences" /tmp/plugin-runtime-names.txt 2>/dev/null && PREFERENCES_REQUIRED=1
+          grep -qF "@capacitor/preferences" /tmp/plugin-signals.txt 2>/dev/null && PREFERENCES_REQUIRED=1
           if [ -z "$PREFERENCES_REQUIRED" ]; then
             echo "[preferences-repair] @capacitor/preferences is not required by this project — skipping repair" | tee -a "$REPORT"
           elif grep -q "^PREFERENCES_TRACE_VERDICT: stage" preferences-plugin-trace.txt 2>/dev/null; then
@@ -1562,6 +1596,33 @@ jobs:
             else
               echo "PREFERENCES_TRACE_VERDICT: unrepairable — see preferences-plugin-trace.txt" | tee -a "$REPORT"
             fi
+          fi
+
+          # Hard gate. Shipping an APK whose Preferences plugin is not
+          # registered means Capacitor.isPluginAvailable('Preferences') returns
+          # false on device and the PKCE code verifier has nowhere durable to
+          # live — the exact race this plugin exists to prevent. So when the app
+          # needs Preferences we fail the build here instead of continuing.
+          if [ -n "$PREFERENCES_REQUIRED" ]; then
+            SETTINGS_OK=""
+            grep -qE "capacitor-preferences|@capacitor/preferences" android/capacitor.settings.gradle 2>/dev/null && SETTINGS_OK=1
+            JSON_OK=""
+            grep -q "PreferencesPlugin" android/app/src/main/assets/capacitor.plugins.json 2>/dev/null && JSON_OK=1
+            NM_OK=""
+            [ -f node_modules/@capacitor/preferences/package.json ] && NM_OK=1
+            if [ -z "$NM_OK" ] || [ -z "$SETTINGS_OK" ] || [ -z "$JSON_OK" ]; then
+              {
+                echo "PREBUILD_VALIDATION_FAILED: @capacitor/preferences is required by this app but is NOT registered in the native Android project, so Capacitor.isPluginAvailable('Preferences') would return false on device and PKCE/session storage would have no native store."
+                echo "  node_modules/@capacitor/preferences:            ${NM_OK:+present}${NM_OK:-MISSING}"
+                echo "  android/capacitor.settings.gradle wiring:       ${SETTINGS_OK:+present}${SETTINGS_OK:-MISSING}"
+                echo "  capacitor.plugins.json PreferencesPlugin entry: ${JSON_OK:+present}${JSON_OK:-MISSING}"
+                echo "  Evidence: preferences-plugin-trace.txt"
+                echo "  Fix: declare \"@capacitor/preferences\" in package.json dependencies at your Capacitor major version and rebuild."
+              } | tee -a "$REPORT"
+              echo "::error::@capacitor/preferences is required but not natively registered — refusing to ship an APK whose PKCE/session storage would silently be unavailable."
+              exit 1
+            fi
+            echo "[preferences-gate] Registered natively: node_modules + capacitor.settings.gradle + capacitor.plugins.json all present" | tee -a "$REPORT"
           fi
           exit 0
 
@@ -2386,6 +2447,13 @@ jobs:
               -Pandroid.injected.signing.key.password="$KEY_PASS"
           }
           gradle_release assembleRelease
+          # Gradle leaves app-release-unsigned.apk behind whenever it also had to
+          # produce an unsigned variant. Both files match the artifact upload
+          # glob, so the user could be handed the unsigned one even though
+          # verification inspected the signed file. Delete the unsigned copies
+          # immediately: nothing downstream may ever see them.
+          find app/build/outputs/apk/release -name '*unsigned*.apk' -print -delete 2>/dev/null \
+            | sed 's/^/[signing] removed unsigned Gradle leftover: /' | tee -a "$REPORT" || true
           # The bundle is best effort: a project that cannot produce an .aab
           # must not fail an otherwise good APK build. The outcome is recorded
           # so the app can explain the missing bundle instead of hiding it.
@@ -2409,8 +2477,19 @@ jobs:
           log() { echo "$1" | tee -a "$VERIFY"; }
           fail() { log "APK_VERIFICATION_FAILED: $1"; echo "::error::$1"; exit 1; }
 
-          APK="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1 || true)"
-          [ -n "$APK" ] || fail "No release APK was produced by Gradle."
+          # Never pick an unsigned Gradle output: "app-release-unsigned.apk" also
+          # matches *.apk, and picking it here (or in the artifact upload) is how
+          # an unsigned APK reaches the user while verification "passes".
+          UNSIGNED="$(find android/app/build/outputs/apk/release -name '*unsigned*.apk' 2>/dev/null | head -n 1 || true)"
+          APK="$(find android/app/build/outputs/apk/release -name '*.apk' ! -name '*unsigned*' 2>/dev/null | sort | head -n 1 || true)"
+          if [ -z "$APK" ]; then
+            [ -z "$UNSIGNED" ] || fail "Gradle produced only an unsigned APK ($UNSIGNED) — the release signingConfig was not applied, so no signed APK exists to deliver."
+            fail "No release APK was produced by Gradle."
+          fi
+          if [ -n "$UNSIGNED" ]; then
+            log "Removing unsigned Gradle leftover so it can never be delivered: $UNSIGNED"
+            rm -f "$UNSIGNED"
+          fi
           log "========== APKForge APK verification =========="
           log "APK: $APK ($(wc -c < "$APK") bytes)"
 
@@ -2418,8 +2497,22 @@ jobs:
           AAPT2="$BT_DIR/aapt2"; APKSIGNER="$BT_DIR/apksigner"
 
           if [ -x "$APKSIGNER" ]; then
-            "$APKSIGNER" verify --print-certs "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
-            log "Signature: valid"
+            "$APKSIGNER" verify --verbose --print-certs "$APK" > /tmp/apk-verify.txt 2>&1 || {
+              cat /tmp/apk-verify.txt | tee -a "$VERIFY"
+              fail "The release APK is not correctly signed."
+            }
+            cat /tmp/apk-verify.txt | tee -a "$VERIFY"
+            # A v1-only signature is rejected by Play and by Android 11+ for
+            # fresh installs on some devices, so "verifies" is not sufficient:
+            # require the APK Signature Scheme v2 (or v3) that Gradle produces
+            # when the signingConfig really applied.
+            if grep -Eqi '\(APK Signature Scheme v[23]\): true' /tmp/apk-verify.txt; then
+              log "Signature: valid (v2/v3 scheme present)"
+            else
+              grep -Ei 'Verified using' /tmp/apk-verify.txt | tee -a "$VERIFY"
+              fail "The release APK carries no APK Signature Scheme v2/v3 block. Android and Google Play reject such a build as improperly signed — the release signingConfig did not apply correctly."
+            fi
+
 
             # A signature that merely *verifies* is not enough — Gradle must
             # have signed with the same certificate the preflight step
@@ -2476,6 +2569,22 @@ jobs:
 
           unzip -l "$APK" | grep -q "assets/public/index.html" || fail "Web assets are missing from the APK (assets/public/index.html not found)."
           log "Web assets: bundled"
+
+          # Plugins the app actually calls (source imports or a surviving
+          # registerPlugin('<Name>') in the shipped bundle) must be inside the
+          # packaged APK, not just "registered somewhere in the project". This
+          # is the check that catches Preferences being absent on device.
+          if [ -n "${APKFORGE_REQUIRED_PLUGINS:-}" ]; then
+            unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-required-plugins.json 2>/dev/null \
+              || fail "The app calls native Capacitor plugins (${APKFORGE_REQUIRED_PLUGINS}) but assets/capacitor.plugins.json is not packaged in the APK, so none of them are registered on device."
+            REQ_MISSING=""
+            for p in $(echo "$APKFORGE_REQUIRED_PLUGINS" | tr ',' ' '); do
+              grep -q "\"$p\"" /tmp/apk-required-plugins.json || REQ_MISSING="$REQ_MISSING $p"
+            done
+            [ -z "$REQ_MISSING" ] || fail "The app calls these Capacitor plugins but the packaged APK does not register them, so Capacitor.isPluginAvailable() returns false on device:$REQ_MISSING"
+            log "Required plugins packaged: ${APKFORGE_REQUIRED_PLUGINS}"
+          fi
+
           # Only packages that expose an @CapacitorPlugin class are expected in
           # capacitor.plugins.json; Gradle-only helper packages are not.
           if [ -n "${APKFORGE_RUNTIME_PLUGINS:-}" ]; then
