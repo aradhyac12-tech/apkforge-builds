@@ -1190,6 +1190,92 @@ jobs:
           cat /tmp/apkforge-env.txt >> "$GITHUB_ENV"
           log "[sync] Runtime-required plugins: $(sed -n 's/^APKFORGE_REQUIRED_PLUGINS=//p' /tmp/apkforge-env.txt | sed 's/^$/none/')"
 
+      - name: Verify plugin modules can compile (NATIVE_MODULE_COMPILE)
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+
+          # A Gradle module can be wired into settings.gradle and still contribute
+          # ZERO classes to the APK — the classic case is a plugin whose Android
+          # sources are Kotlin while its own module build.gradle never applies the
+          # Kotlin plugin (Gradle then simply ignores every .kt file and the build
+          # still "succeeds"). That is exactly the shape of failure that surfaces
+          # much later as "class absent from dex", so it is diagnosed and repaired
+          # here, deterministically and per module, from native-manifest.json.
+          cat > /tmp/apkforge-module-compile.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const root = process.cwd();
+          const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return ''; } };
+          const man = JSON.parse(read(path.join(root, 'native-manifest.json')) || '{"plugins":[]}');
+          const walk = (dir, out) => {
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return out; }
+            for (const e of entries) {
+              if (e.name === 'build' || e.name === 'node_modules' || e.name === '.git') continue;
+              const full = path.join(dir, e.name);
+              if (e.isDirectory()) walk(full, out);
+              else out.push(full);
+            }
+            return out;
+          };
+          let kotlinNeeded = false;
+          const patched = [];
+          const problems = [];
+          for (const p of man.plugins) {
+            if (!p.android) continue;
+            const base = path.join(root, 'node_modules', p.package, 'android');
+            if (!fs.existsSync(base)) { problems.push(p.package + ' [no android/ directory in the installed package]'); continue; }
+            const files = walk(base, []);
+            const kt = files.filter((f) => f.endsWith('.kt'));
+            const java = files.filter((f) => f.endsWith('.java'));
+            const gradleFile = ['build.gradle', 'build.gradle.kts'].map((n) => path.join(base, n)).find((f) => fs.existsSync(f));
+            if (!gradleFile) { problems.push(p.package + ' [android/ has no build.gradle, so Gradle compiles nothing for it]'); continue; }
+            console.log('[modules] ' + p.package + ' sources: ' + java.length + ' java, ' + kt.length + ' kotlin (' + path.basename(gradleFile) + ')');
+            if (!java.length && !kt.length) { problems.push(p.package + ' [android/ contains no Java or Kotlin sources]'); continue; }
+            if (kt.length) {
+              kotlinNeeded = true;
+              const g = read(gradleFile);
+              const hasKotlin = /kotlin-android|org\.jetbrains\.kotlin\.android|kotlin\(['"]android/.test(g);
+              if (!hasKotlin && gradleFile.endsWith('.gradle')) {
+                fs.writeFileSync(gradleFile, "apply plugin: 'kotlin-android'\n" + g + "\ndependencies {\n    implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.25'\n}\n");
+                patched.push(p.package);
+                console.log('[modules] REPAIR ' + p.package + ': Kotlin sources present but the module never applied the Kotlin plugin — applied kotlin-android so its classes are actually compiled');
+              } else if (!hasKotlin) {
+                problems.push(p.package + ' [Kotlin sources with a .kts build script that does not apply the Kotlin plugin]');
+              }
+            }
+          }
+          if (kotlinNeeded) {
+            const rootGradlePath = path.join(root, 'android', 'build.gradle');
+            const rg = read(rootGradlePath);
+            if (rg && !/kotlin-gradle-plugin/.test(rg)) {
+              const ver = '1.9.25';
+              const withVer = /ext\s*\{/.test(rg)
+                ? rg.replace(/ext\s*\{/, "ext {\n        kotlin_version = '" + ver + "'")
+                : "buildscript { ext { kotlin_version = '" + ver + "' } }\n" + rg;
+              const withClasspath = withVer.replace(
+                /(classpath\s+['"]com\.android\.tools\.build:gradle[^\n]*\n)/,
+                "$1        classpath \"org.jetbrains.kotlin:kotlin-gradle-plugin:" + ver + "\"\n"
+              );
+              fs.writeFileSync(rootGradlePath, withClasspath);
+              console.log('[modules] REPAIR android/build.gradle: added the Kotlin Gradle plugin classpath required by ' + patched.join(', '));
+            }
+          }
+          fs.writeFileSync('/tmp/apkforge-module-problems.txt', problems.join(' | '));
+          problems.forEach((p) => console.log('[modules] PROBLEM: ' + p));
+          NODEEOF
+
+          node /tmp/apkforge-module-compile.cjs | tee -a "$REPORT"
+          PROBLEMS="$(cat /tmp/apkforge-module-problems.txt 2>/dev/null)"
+          if [ -n "$PROBLEMS" ]; then
+            fail "stage=NATIVE_MODULE_COMPILE command='inspect node_modules/<plugin>/android sources and build script' package='$PROBLEMS' detected='plugin Gradle module cannot contribute compiled classes' expected='each native plugin module has a build script and Java/Kotlin sources it actually compiles' remediation='fix the plugin package Android module (add its build.gradle, its sources, or the Kotlin plugin) and re-upload the project'"
+          fi
+          log "[modules] Every native plugin module can contribute compiled classes"
+
+
       - name: Browser plugin forensic trace (post-sync)
         if: success() || failure()
         working-directory: project
@@ -2523,17 +2609,33 @@ jobs:
               EPKG="${ENTRY%%=*}"; FQCN="${ENTRY#*=}"
               [ -n "$FQCN" ] || continue
               CLASS_PATH="$(echo "$FQCN" | tr '.' '/')"
+              # A class name can arrive with a masked segment (Actions redacts any
+              # substring matching a secret), so an exact match is not always
+              # possible. In that case the package path prefix is authoritative.
+              case "$FQCN" in
+                *'*'*) CLASS_PATH="$(echo "$FQCN" | sed -E 's/[^.]*\*+[^.]*//g; s/\.+/./g; s/\.$//' | tr '.' '/')" ;;
+              esac
               if grep -qF "$CLASS_PATH" "$DEX_STRINGS_FILE" 2>/dev/null; then
                 log "DEX class present: $EPKG -> $FQCN"
               else
                 log "DEX class NOT FOUND: $EPKG -> $FQCN"
+                # Precise diagnosis instead of a guess: did the plugin's own
+                # Gradle module compile anything at all?
+                MOD_DIR="node_modules/$EPKG/android"
+                COMPILED="$(find "$MOD_DIR/build" -name '*.class' 2>/dev/null | wc -l | tr -d ' ')"
+                SRC_COUNT="$(find "$MOD_DIR" -name '*.java' -o -name '*.kt' 2>/dev/null | grep -vc '/build/' || true)"
+                log "  diagnosis: $EPKG sources=$SRC_COUNT compiled-classes=${COMPILED:-0} (module $MOD_DIR)"
+                if [ "${COMPILED:-0}" = "0" ]; then
+                  log "  cause: the plugin Gradle module produced no compiled classes — its Android sources were not compiled by any Gradle task"
+                fi
                 DEX_CLASS_MISSING="$DEX_CLASS_MISSING $EPKG"
               fi
             done
             rm -f "$DEX_STRINGS_FILE"
-            [ -z "$DEX_CLASS_MISSING" ] || fail "stage=APK_VERIFICATION command='unzip -p $APK classes*.dex | strings' package='$DEX_CLASS_MISSING' detected=class-absent-from-dex expected='the @CapacitorPlugin class declared in the package Android sources compiled into the APK' remediation='the plugin module is registered but not compiled in — check minification/ProGuard keep rules and that android/capacitor.build.gradle depends on the plugin project'"
+            [ -z "$DEX_CLASS_MISSING" ] || fail "stage=APK_VERIFICATION command='unzip -p $APK classes*.dex | strings' package='$DEX_CLASS_MISSING' detected=class-absent-from-dex expected='the @CapacitorPlugin class declared in the package Android sources compiled into the APK' remediation='see the per-package diagnosis lines above — when the module produced no compiled classes, its Android module build script does not compile its sources (missing Kotlin plugin, wrong source set path, or empty android/src); fix the plugin package and re-upload'"
             log "DEX-level plugin verification: passed (classes taken from plugin sources, not guessed)"
           fi
+
           log "APK_VERIFICATION_PASSED"
 
           # ----- App Bundle (.aab) -----
