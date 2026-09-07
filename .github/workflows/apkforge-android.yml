@@ -1370,12 +1370,12 @@ jobs:
               fi
             done
 
-            # 8. MainActivity
-            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            # 8. MainActivity (Java or Kotlin — Capacitor 8.x may generate either template)
+            MA="$(find android/app/src/main/java android/app/src/main/kotlin ( -name MainActivity.java -o -name MainActivity.kt ) 2>/dev/null | head -n 1)"
             if [ -n "$MA" ]; then
               out "8 ----- $MA (full contents) -----"
               sed 's/^/      /' "$MA" | tee -a "$TRACE"
-              if grep -q "extends BridgeActivity" "$MA"; then
+              if grep -qE "extends BridgeActivity|:[[:space:]]*BridgeActivity()" "$MA"; then
                 out "8 PASS  MainActivity extends BridgeActivity (auto-registration path intact)"
               else
                 out "8 FAIL  MainActivity does not extend BridgeActivity"
@@ -1389,13 +1389,13 @@ jobs:
                 out "8 PASS  MainActivity uses Capacitor auto-registration (no explicit registerPlugin list)"
               fi
               if grep -q "ApkforgeOAuthDiagnostics" "$MA"; then
-                out "8 INFO  APKForge diagnostics injection is present in MainActivity (class declaration unchanged: $(grep -c 'extends BridgeActivity' "$MA") BridgeActivity declaration(s))"
+                out "8 INFO  APKForge diagnostics injection is present in MainActivity ($MA)"
               else
                 out "8 INFO  No APKForge diagnostics injection in MainActivity"
               fi
             else
-              out "8 FAIL  MainActivity.java not found under android/app/src/main/java"
-              note "stage 8 — MainActivity.java is missing from the native project"
+              out "8 FAIL  Neither MainActivity.java nor MainActivity.kt found under android/app/src/main/{java,kotlin}"
+              note "stage 8 — MainActivity is missing from the native project"
             fi
           fi
 
@@ -1560,10 +1560,10 @@ jobs:
               fi
             done
 
-            # 8. MainActivity — same auto-registration path as Browser
-            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            # 8. MainActivity — same auto-registration path as Browser (Java or Kotlin)
+            MA="$(find android/app/src/main/java android/app/src/main/kotlin ( -name MainActivity.java -o -name MainActivity.kt ) 2>/dev/null | head -n 1)"
             if [ -n "$MA" ]; then
-              if grep -q "extends BridgeActivity" "$MA"; then
+              if grep -qE "extends BridgeActivity|:[[:space:]]*BridgeActivity()" "$MA"; then
                 out "8 PASS  MainActivity extends BridgeActivity (auto-registration path intact)"
               else
                 out "8 FAIL  MainActivity does not extend BridgeActivity"
@@ -1573,8 +1573,8 @@ jobs:
                 grep -q "PreferencesPlugin" "$MA" || note "stage 8 — MainActivity registers an explicit plugin list that omits PreferencesPlugin"
               fi
             else
-              out "8 FAIL  MainActivity.java not found under android/app/src/main/java"
-              note "stage 8 — MainActivity.java is missing from the native project"
+              out "8 FAIL  Neither MainActivity.java nor MainActivity.kt found under android/app/src/main/{java,kotlin}"
+              note "stage 8 — MainActivity is missing from the native project"
             fi
           fi
 
@@ -1665,6 +1665,135 @@ jobs:
         working-directory: project
         run: |
           set +e
+          echo "[native-verify] Writing structural AndroidManifest intent-filter checker" | tee -a "$REPORT"
+          cat > /tmp/apkforge-manifest-structural-check.cjs <<'CHECKEOF'
+          // Structural AndroidManifest intent-filter verifier.
+          //
+          // Confirms that action VIEW, category DEFAULT, category BROWSABLE and a
+          // matching URI scheme all live inside the SAME <intent-filter> element,
+          // instead of checking whether each string occurs anywhere in the file
+          // independently. Four attributes scattered across four unrelated
+          // intent-filters (e.g. one added by a push-notification plugin, one for
+          // https App Links, one for an unrelated custom scheme) previously satisfied
+          // four separate greps and reported a deep link as present when it was not.
+          //
+          // Works against two input shapes:
+          //   - raw AndroidManifest.xml source (source tree, pre-build)
+          //   - `aapt2 dump xmltree --file AndroidManifest.xml <apk>` output (packaged APK)
+          // so the same logic gates both the pre-build patch and the final artifact.
+          //
+          // Usage: node apkforge-manifest-structural-check.cjs <file> [schemesCsv] [host]
+          const fs = require('fs');
+
+          const file = process.argv[2];
+          const expectedSchemesArg = process.argv[3] || '';
+          const expectedHost = process.argv[4] || '';
+
+          if (!file || !fs.existsSync(file)) {
+            console.error('[manifest-check] FAIL file not found: ' + file);
+            process.exit(1);
+          }
+          const text = fs.readFileSync(file, 'utf8');
+          const expectedSchemes = expectedSchemesArg.split(',').map((s) => s.trim()).filter(Boolean);
+
+          function extractBlocksXml(t) {
+            const blocks = [];
+            const re = /<intent-filter\b[\s\S]*?<\/intent-filter>/g;
+            let m;
+            while ((m = re.exec(t))) blocks.push(m[0]);
+            return blocks;
+          }
+
+          // aapt2's xmltree dump nests children under a line like `E: intent-filter (line=42)`
+          // using two-space indentation per level; the block ends at the first line back at
+          // or above that indentation.
+          function extractBlocksXmltree(t) {
+            const lines = t.split('\n');
+            const blocks = [];
+            let collecting = false;
+            let baseIndent = -1;
+            let current = [];
+            const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length;
+            for (const line of lines) {
+              if (/E: intent-filter\b/.test(line)) {
+                if (collecting) blocks.push(current.join('\n'));
+                collecting = true;
+                baseIndent = indentOf(line);
+                current = [line];
+                continue;
+              }
+              if (collecting) {
+                if (line.trim() === '') { current.push(line); continue; }
+                const ind = indentOf(line);
+                if (ind <= baseIndent) {
+                  blocks.push(current.join('\n'));
+                  collecting = false;
+                  current = [];
+                } else {
+                  current.push(line);
+                }
+              }
+            }
+            if (collecting) blocks.push(current.join('\n'));
+            return blocks;
+          }
+
+          const isXmltree = /E: manifest\b/.test(text) || /E: intent-filter\b/.test(text) || /^N: android=/.test(text);
+          const blocks = isXmltree ? extractBlocksXmltree(text) : extractBlocksXml(text);
+
+          if (!blocks.length) {
+            console.error('[manifest-check] FAIL no <intent-filter> elements found in ' + file);
+            process.exit(1);
+          }
+
+          const has = (block, needle) => block.toLowerCase().includes(needle.toLowerCase());
+
+          let matched = null;
+          let matchedScheme = null;
+          const nearMisses = [];
+          for (const b of blocks) {
+            const hasView = has(b, 'android.intent.action.view');
+            const hasDefault = has(b, 'android.intent.category.default');
+            const hasBrowsable = has(b, 'android.intent.category.browsable');
+            if (!(hasView && hasDefault && hasBrowsable)) {
+              nearMisses.push('view=' + hasView + ' default=' + hasDefault + ' browsable=' + hasBrowsable);
+              continue;
+            }
+            // Match "scheme" and the expected value inside the same line, quoted —
+            // this covers both raw-XML (`android:scheme="duospace"`) and aapt2
+            // xmltree (`android:scheme(0x01010027)="duospace"`) shapes, where an
+            // attribute's resource-id hex blob sits between the name and the value.
+            const valueOnSameLine = (attr, value) => {
+              const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(attr + '[^\\n]*["\']' + escaped + '["\']', 'i');
+              return b.split('\n').some((line) => re.test(line));
+            };
+            const schemeMatch = expectedSchemes.find((s) => valueOnSameLine('scheme', s));
+            const schemeOk = expectedSchemes.length === 0 || !!schemeMatch;
+            const hostOk = !expectedHost || valueOnSameLine('host', expectedHost);
+            if (schemeOk && hostOk) {
+              matched = b;
+              matchedScheme = schemeMatch || '(any)';
+              break;
+            }
+          }
+
+          if (!matched) {
+            console.error(
+              '[manifest-check] FAIL no single <intent-filter> in ' + file +
+              ' contains action VIEW + category DEFAULT + category BROWSABLE' +
+              (expectedSchemes.length ? ' + scheme in [' + expectedSchemes.join(', ') + ']' : '') +
+              (expectedHost ? ' + host=' + expectedHost : '') +
+              ' together (' + blocks.length + ' intent-filter element(s) inspected: ' + nearMisses.join(' | ') + ')'
+            );
+            process.exit(1);
+          }
+          console.log(
+            '[manifest-check] PASS structurally valid VIEW/DEFAULT/BROWSABLE intent-filter found in ' + file +
+            (expectedSchemes.length ? ' (scheme=' + matchedScheme + ')' : '')
+          );
+          process.exit(0);
+          CHECKEOF
           cat > /tmp/apkforge-app-trace.sh <<'TRACEEOF'
           #!/usr/bin/env bash
           # Same evidence chain as Browser/Preferences, for @capacitor/app.
@@ -1733,12 +1862,13 @@ jobs:
               fi
             done
 
-            # MainActivity + deep-link intent filter — this is the plugin
-            # that actually receives the OAuth callback via appUrlOpen/
-            # getLaunchUrl, so the intent filter is part of its contract.
-            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            # MainActivity (Java or Kotlin) + deep-link intent filter — this is
+            # the plugin that actually receives the OAuth callback via
+            # appUrlOpen/getLaunchUrl, so the intent filter is part of its
+            # contract.
+            MA="$(find android/app/src/main/java android/app/src/main/kotlin ( -name MainActivity.java -o -name MainActivity.kt ) 2>/dev/null | head -n 1)"
             if [ -n "$MA" ]; then
-              if grep -q "extends BridgeActivity" "$MA"; then
+              if grep -qE "extends BridgeActivity|:[[:space:]]*BridgeActivity()" "$MA"; then
                 out "7 PASS  MainActivity extends BridgeActivity"
               else
                 out "7 FAIL  MainActivity does not extend BridgeActivity"
@@ -1748,17 +1878,23 @@ jobs:
                 grep -q "AppPlugin" "$MA" || note "stage 7 — MainActivity registers an explicit plugin list that omits AppPlugin"
               fi
             else
-              out "7 FAIL  MainActivity.java not found under android/app/src/main/java"
-              note "stage 7 — MainActivity.java is missing from the native project"
+              out "7 FAIL  Neither MainActivity.java nor MainActivity.kt found under android/app/src/main/{java,kotlin}"
+              note "stage 7 — MainActivity is missing from the native project"
             fi
 
+            # Structural check: VIEW + DEFAULT + BROWSABLE + a scheme must all
+            # live inside the SAME <intent-filter>, not just appear somewhere
+            # in the file independently (a loose "does VIEW occur anywhere
+            # AND does BROWSABLE occur anywhere" check previously reported a
+            # false PASS when those strings came from two unrelated filters).
             MANIFEST="android/app/src/main/AndroidManifest.xml"
             if [ -f "$MANIFEST" ]; then
-              if grep -q "android.intent.action.VIEW" "$MANIFEST" && grep -q "android.intent.category.BROWSABLE" "$MANIFEST"; then
-                out "8 PASS  $MANIFEST has a VIEW/BROWSABLE intent filter (deep-link callback route)"
+              EXPECTED_SCHEMES="$(paste -sd, android-expected-schemes.txt 2>/dev/null || true)"
+              if node /tmp/apkforge-manifest-structural-check.cjs "$MANIFEST" "$EXPECTED_SCHEMES" >> "$TRACE" 2>&1; then
+                out "8 PASS  $MANIFEST has a structurally valid VIEW/DEFAULT/BROWSABLE intent filter (deep-link callback route)"
               else
-                out "8 FAIL  $MANIFEST has no VIEW/BROWSABLE intent filter"
-                note "stage 8 — no deep-link intent filter in AndroidManifest.xml, so appUrlOpen can never fire"
+                out "8 FAIL  $MANIFEST has no structurally valid VIEW/DEFAULT/BROWSABLE intent filter"
+                note "stage 8 — no structurally valid deep-link intent filter in AndroidManifest.xml, so appUrlOpen can never fire"
               fi
             else
               out "8 FAIL  $MANIFEST is missing"
@@ -1793,11 +1929,27 @@ jobs:
                 note "stage 10 — the App native class was never compiled into the APK"
               fi
 
-              if unzip -p "$APK" AndroidManifest.xml > /tmp/apkforge-app-manifest.bin 2>/dev/null && strings /tmp/apkforge-app-manifest.bin 2>/dev/null | grep -qi "BROWSABLE"; then
-                out "11 PASS  final packaged AndroidManifest.xml retains a BROWSABLE intent filter"
+              # The packaged AndroidManifest.xml is binary AXML — a loose
+              # "does the substring BROWSABLE occur anywhere in a strings(1)
+              # dump" check previously reported a false PASS whenever any
+              # unrelated intent-filter (or even an unrelated string in the
+              # binary) happened to contain that word, regardless of whether
+              # a real VIEW/DEFAULT/BROWSABLE deep-link filter existed. Use
+              # aapt2's structural xmltree dump instead, and require VIEW +
+              # DEFAULT + BROWSABLE + scheme to co-occur in one intent-filter.
+              APP_BT_DIR="$(ls -d ${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+              APP_AAPT2="$APP_BT_DIR/aapt2"
+              if [ -x "$APP_AAPT2" ] && "$APP_AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > /tmp/apkforge-app-xmltree.txt 2>/dev/null; then
+                APP_SCHEMES=""
+                [ -f android-expected-schemes.txt ] && APP_SCHEMES="$(paste -sd, android-expected-schemes.txt)"
+                if node /tmp/apkforge-manifest-structural-check.cjs /tmp/apkforge-app-xmltree.txt "$APP_SCHEMES" >> "$TRACE" 2>&1; then
+                  out "11 PASS  final packaged AndroidManifest.xml retains a structurally valid VIEW/DEFAULT/BROWSABLE intent filter"
+                else
+                  out "11 FAIL  final packaged AndroidManifest.xml has no structurally valid VIEW/DEFAULT/BROWSABLE intent filter"
+                  note "stage 11 — the deep-link intent filter did not survive into the final packaged manifest"
+                fi
               else
-                out "11 FAIL  final packaged AndroidManifest.xml has no BROWSABLE intent filter"
-                note "stage 11 — the deep-link intent filter did not survive into the final packaged manifest"
+                out "11 WARN  aapt2 unavailable — could not structurally verify the packaged manifest (authoritative check runs in 'Verify release APK')"
               fi
             fi
           fi
@@ -2026,6 +2178,146 @@ jobs:
           log('[validate] Native configuration validated');
           NODEEOF
           node /tmp/apkforge-native-check.cjs
+
+          # Fail-fast self-check: confirm the patch just applied actually
+          # produced a structurally valid VIEW/DEFAULT/BROWSABLE intent
+          # filter for one of the derived schemes, rather than trusting that
+          # writing the XML succeeded. This is the same structural check
+          # used later against the packaged APK, run here immediately after
+          # patching so a regression is caught at the source instead of
+          # surfacing as a confusing failure several steps downstream.
+          cat > /tmp/apkforge-manifest-structural-check.cjs <<'CHECKEOF'
+          // Structural AndroidManifest intent-filter verifier.
+          //
+          // Confirms that action VIEW, category DEFAULT, category BROWSABLE and a
+          // matching URI scheme all live inside the SAME <intent-filter> element,
+          // instead of checking whether each string occurs anywhere in the file
+          // independently. Four attributes scattered across four unrelated
+          // intent-filters (e.g. one added by a push-notification plugin, one for
+          // https App Links, one for an unrelated custom scheme) previously satisfied
+          // four separate greps and reported a deep link as present when it was not.
+          //
+          // Works against two input shapes:
+          //   - raw AndroidManifest.xml source (source tree, pre-build)
+          //   - `aapt2 dump xmltree --file AndroidManifest.xml <apk>` output (packaged APK)
+          // so the same logic gates both the pre-build patch and the final artifact.
+          //
+          // Usage: node apkforge-manifest-structural-check.cjs <file> [schemesCsv] [host]
+          const fs = require('fs');
+
+          const file = process.argv[2];
+          const expectedSchemesArg = process.argv[3] || '';
+          const expectedHost = process.argv[4] || '';
+
+          if (!file || !fs.existsSync(file)) {
+            console.error('[manifest-check] FAIL file not found: ' + file);
+            process.exit(1);
+          }
+          const text = fs.readFileSync(file, 'utf8');
+          const expectedSchemes = expectedSchemesArg.split(',').map((s) => s.trim()).filter(Boolean);
+
+          function extractBlocksXml(t) {
+            const blocks = [];
+            const re = /<intent-filter\b[\s\S]*?<\/intent-filter>/g;
+            let m;
+            while ((m = re.exec(t))) blocks.push(m[0]);
+            return blocks;
+          }
+
+          // aapt2's xmltree dump nests children under a line like `E: intent-filter (line=42)`
+          // using two-space indentation per level; the block ends at the first line back at
+          // or above that indentation.
+          function extractBlocksXmltree(t) {
+            const lines = t.split('\n');
+            const blocks = [];
+            let collecting = false;
+            let baseIndent = -1;
+            let current = [];
+            const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length;
+            for (const line of lines) {
+              if (/E: intent-filter\b/.test(line)) {
+                if (collecting) blocks.push(current.join('\n'));
+                collecting = true;
+                baseIndent = indentOf(line);
+                current = [line];
+                continue;
+              }
+              if (collecting) {
+                if (line.trim() === '') { current.push(line); continue; }
+                const ind = indentOf(line);
+                if (ind <= baseIndent) {
+                  blocks.push(current.join('\n'));
+                  collecting = false;
+                  current = [];
+                } else {
+                  current.push(line);
+                }
+              }
+            }
+            if (collecting) blocks.push(current.join('\n'));
+            return blocks;
+          }
+
+          const isXmltree = /E: manifest\b/.test(text) || /E: intent-filter\b/.test(text) || /^N: android=/.test(text);
+          const blocks = isXmltree ? extractBlocksXmltree(text) : extractBlocksXml(text);
+
+          if (!blocks.length) {
+            console.error('[manifest-check] FAIL no <intent-filter> elements found in ' + file);
+            process.exit(1);
+          }
+
+          const has = (block, needle) => block.toLowerCase().includes(needle.toLowerCase());
+
+          let matched = null;
+          let matchedScheme = null;
+          const nearMisses = [];
+          for (const b of blocks) {
+            const hasView = has(b, 'android.intent.action.view');
+            const hasDefault = has(b, 'android.intent.category.default');
+            const hasBrowsable = has(b, 'android.intent.category.browsable');
+            if (!(hasView && hasDefault && hasBrowsable)) {
+              nearMisses.push('view=' + hasView + ' default=' + hasDefault + ' browsable=' + hasBrowsable);
+              continue;
+            }
+            // Match "scheme" and the expected value inside the same line, quoted —
+            // this covers both raw-XML (`android:scheme="duospace"`) and aapt2
+            // xmltree (`android:scheme(0x01010027)="duospace"`) shapes, where an
+            // attribute's resource-id hex blob sits between the name and the value.
+            const valueOnSameLine = (attr, value) => {
+              const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(attr + '[^\\n]*["\']' + escaped + '["\']', 'i');
+              return b.split('\n').some((line) => re.test(line));
+            };
+            const schemeMatch = expectedSchemes.find((s) => valueOnSameLine('scheme', s));
+            const schemeOk = expectedSchemes.length === 0 || !!schemeMatch;
+            const hostOk = !expectedHost || valueOnSameLine('host', expectedHost);
+            if (schemeOk && hostOk) {
+              matched = b;
+              matchedScheme = schemeMatch || '(any)';
+              break;
+            }
+          }
+
+          if (!matched) {
+            console.error(
+              '[manifest-check] FAIL no single <intent-filter> in ' + file +
+              ' contains action VIEW + category DEFAULT + category BROWSABLE' +
+              (expectedSchemes.length ? ' + scheme in [' + expectedSchemes.join(', ') + ']' : '') +
+              (expectedHost ? ' + host=' + expectedHost : '') +
+              ' together (' + blocks.length + ' intent-filter element(s) inspected: ' + nearMisses.join(' | ') + ')'
+            );
+            process.exit(1);
+          }
+          console.log(
+            '[manifest-check] PASS structurally valid VIEW/DEFAULT/BROWSABLE intent-filter found in ' + file +
+            (expectedSchemes.length ? ' (scheme=' + matchedScheme + ')' : '')
+          );
+          process.exit(0);
+          CHECKEOF
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          EXPECTED_SCHEMES="$(paste -sd, android-expected-schemes.txt 2>/dev/null || true)"
+          node /tmp/apkforge-manifest-structural-check.cjs "$MANIFEST" "$EXPECTED_SCHEMES" | tee -a "$REPORT" \
+            || { echo "PREBUILD_VALIDATION_FAILED: patched AndroidManifest.xml has no structurally valid VIEW/DEFAULT/BROWSABLE intent filter" | tee -a "$REPORT"; echo "::error::Native patch did not produce a structurally valid deep-link intent filter."; exit 1; }
           echo "PREBUILD_VALIDATION_PASSED" | tee -a "$REPORT"
 
       - name: OAuth readiness validation
@@ -2045,6 +2337,135 @@ jobs:
           }
           has() { grep -qF "$1" "$2" 2>/dev/null; echo $?; }
 
+          cat > /tmp/apkforge-manifest-structural-check.cjs <<'CHECKEOF'
+          // Structural AndroidManifest intent-filter verifier.
+          //
+          // Confirms that action VIEW, category DEFAULT, category BROWSABLE and a
+          // matching URI scheme all live inside the SAME <intent-filter> element,
+          // instead of checking whether each string occurs anywhere in the file
+          // independently. Four attributes scattered across four unrelated
+          // intent-filters (e.g. one added by a push-notification plugin, one for
+          // https App Links, one for an unrelated custom scheme) previously satisfied
+          // four separate greps and reported a deep link as present when it was not.
+          //
+          // Works against two input shapes:
+          //   - raw AndroidManifest.xml source (source tree, pre-build)
+          //   - `aapt2 dump xmltree --file AndroidManifest.xml <apk>` output (packaged APK)
+          // so the same logic gates both the pre-build patch and the final artifact.
+          //
+          // Usage: node apkforge-manifest-structural-check.cjs <file> [schemesCsv] [host]
+          const fs = require('fs');
+
+          const file = process.argv[2];
+          const expectedSchemesArg = process.argv[3] || '';
+          const expectedHost = process.argv[4] || '';
+
+          if (!file || !fs.existsSync(file)) {
+            console.error('[manifest-check] FAIL file not found: ' + file);
+            process.exit(1);
+          }
+          const text = fs.readFileSync(file, 'utf8');
+          const expectedSchemes = expectedSchemesArg.split(',').map((s) => s.trim()).filter(Boolean);
+
+          function extractBlocksXml(t) {
+            const blocks = [];
+            const re = /<intent-filter\b[\s\S]*?<\/intent-filter>/g;
+            let m;
+            while ((m = re.exec(t))) blocks.push(m[0]);
+            return blocks;
+          }
+
+          // aapt2's xmltree dump nests children under a line like `E: intent-filter (line=42)`
+          // using two-space indentation per level; the block ends at the first line back at
+          // or above that indentation.
+          function extractBlocksXmltree(t) {
+            const lines = t.split('\n');
+            const blocks = [];
+            let collecting = false;
+            let baseIndent = -1;
+            let current = [];
+            const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length;
+            for (const line of lines) {
+              if (/E: intent-filter\b/.test(line)) {
+                if (collecting) blocks.push(current.join('\n'));
+                collecting = true;
+                baseIndent = indentOf(line);
+                current = [line];
+                continue;
+              }
+              if (collecting) {
+                if (line.trim() === '') { current.push(line); continue; }
+                const ind = indentOf(line);
+                if (ind <= baseIndent) {
+                  blocks.push(current.join('\n'));
+                  collecting = false;
+                  current = [];
+                } else {
+                  current.push(line);
+                }
+              }
+            }
+            if (collecting) blocks.push(current.join('\n'));
+            return blocks;
+          }
+
+          const isXmltree = /E: manifest\b/.test(text) || /E: intent-filter\b/.test(text) || /^N: android=/.test(text);
+          const blocks = isXmltree ? extractBlocksXmltree(text) : extractBlocksXml(text);
+
+          if (!blocks.length) {
+            console.error('[manifest-check] FAIL no <intent-filter> elements found in ' + file);
+            process.exit(1);
+          }
+
+          const has = (block, needle) => block.toLowerCase().includes(needle.toLowerCase());
+
+          let matched = null;
+          let matchedScheme = null;
+          const nearMisses = [];
+          for (const b of blocks) {
+            const hasView = has(b, 'android.intent.action.view');
+            const hasDefault = has(b, 'android.intent.category.default');
+            const hasBrowsable = has(b, 'android.intent.category.browsable');
+            if (!(hasView && hasDefault && hasBrowsable)) {
+              nearMisses.push('view=' + hasView + ' default=' + hasDefault + ' browsable=' + hasBrowsable);
+              continue;
+            }
+            // Match "scheme" and the expected value inside the same line, quoted —
+            // this covers both raw-XML (`android:scheme="duospace"`) and aapt2
+            // xmltree (`android:scheme(0x01010027)="duospace"`) shapes, where an
+            // attribute's resource-id hex blob sits between the name and the value.
+            const valueOnSameLine = (attr, value) => {
+              const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(attr + '[^\\n]*["\']' + escaped + '["\']', 'i');
+              return b.split('\n').some((line) => re.test(line));
+            };
+            const schemeMatch = expectedSchemes.find((s) => valueOnSameLine('scheme', s));
+            const schemeOk = expectedSchemes.length === 0 || !!schemeMatch;
+            const hostOk = !expectedHost || valueOnSameLine('host', expectedHost);
+            if (schemeOk && hostOk) {
+              matched = b;
+              matchedScheme = schemeMatch || '(any)';
+              break;
+            }
+          }
+
+          if (!matched) {
+            console.error(
+              '[manifest-check] FAIL no single <intent-filter> in ' + file +
+              ' contains action VIEW + category DEFAULT + category BROWSABLE' +
+              (expectedSchemes.length ? ' + scheme in [' + expectedSchemes.join(', ') + ']' : '') +
+              (expectedHost ? ' + host=' + expectedHost : '') +
+              ' together (' + blocks.length + ' intent-filter element(s) inspected: ' + nearMisses.join(' | ') + ')'
+            );
+            process.exit(1);
+          }
+          console.log(
+            '[manifest-check] PASS structurally valid VIEW/DEFAULT/BROWSABLE intent-filter found in ' + file +
+            (expectedSchemes.length ? ' (scheme=' + matchedScheme + ')' : '')
+          );
+          process.exit(0);
+          CHECKEOF
+
           OAUTH_SIGNAL=""
           grep -rIlqE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios "@supabase/supabase-js|firebase/auth|@auth0/|@clerk/|signInWithOAuth|oauth" . 2>/dev/null && OAUTH_SIGNAL=1
 
@@ -2058,7 +2479,9 @@ jobs:
             check "@capacitor/app registered in Gradle" "$(has '@capacitor/app' "$SETTINGS")" warn
           fi
           check "custom-scheme intent filter present" "$(has 'android:scheme=' "$MANIFEST")" warn
-          check "app-link (https) intent filter present" "$(grep -c 'android:scheme="https"' "$MANIFEST" >/dev/null 2>&1 && grep -q 'android:scheme="https"' "$MANIFEST" && echo 0 || echo 1)" warn
+          OAUTH_EXPECTED_SCHEMES=""
+          [ -f android-expected-schemes.txt ] && OAUTH_EXPECTED_SCHEMES="$(paste -sd, android-expected-schemes.txt)"
+          check "structurally valid VIEW/DEFAULT/BROWSABLE deep-link intent filter" "$(node /tmp/apkforge-manifest-structural-check.cjs "$MANIFEST" "$OAUTH_EXPECTED_SCHEMES" >> "$REPORT" 2>&1; echo $?)" fatal
           check "launchMode=singleTask on MainActivity" "$(has 'android:launchMode="singleTask"' "$MANIFEST")" fatal
           check "appUrlOpen bridge injected" "$(grep -rq 'appUrlOpen' android/app/src/main 2>/dev/null && echo 0 || echo 1)" warn
 
@@ -2075,11 +2498,16 @@ jobs:
         run: |
           set -e
           log() { echo "$1" | tee -a "$REPORT"; }
+          log "[oauth-diagnostics] Starting native OAuth lifecycle diagnostics patch (Java + Kotlin MainActivity)"
           cat > /tmp/apkforge-mainactivity-diagnostics.cjs <<'NODEEOF'
           const fs = require('fs');
           const path = require('path');
           const report = process.env.REPORT;
           const log = (m) => { console.log(m); fs.appendFileSync(report, m + '\n'); };
+
+          // Both Java and Kotlin Capacitor Android templates are supported. Capacitor
+          // 8.x may generate either MainActivity.java or MainActivity.kt depending on
+          // the project template, and this must not assume Java only.
           function walk(dir) {
             const out = [];
             let entries = [];
@@ -2087,77 +2515,113 @@ jobs:
             for (const e of entries) {
               const full = path.join(dir, e.name);
               if (e.isDirectory()) out.push(...walk(full));
-              else if (e.name === 'MainActivity.java') out.push(full);
+              else if (e.name === 'MainActivity.java' || e.name === 'MainActivity.kt') out.push(full);
             }
             return out;
           }
-          const candidates = walk('android/app/src/main/java');
-          if (!candidates.length) throw new Error('MainActivity.java was not found in the native Android project.');
+          const candidates = walk('android/app/src/main/java').concat(walk('android/app/src/main/kotlin'));
+          if (!candidates.length) throw new Error('Neither MainActivity.java nor MainActivity.kt was found in the native Android project.');
+          // Deterministic when both somehow exist: Java first, matching prior behavior.
+          candidates.sort((a, b) => (a.endsWith('.java') ? 0 : 1) - (b.endsWith('.java') ? 0 : 1));
           const mainPath = candidates[0];
+          const isKotlin = mainPath.endsWith('.kt');
+          log('[oauth-diagnostics] Detected Android ' + (isKotlin ? 'MainActivity.kt (Kotlin)' : 'MainActivity.java (Java)') + ' at ' + mainPath);
+
           let main = fs.readFileSync(mainPath, 'utf8');
-          const pkg = (main.match(/^\s*package\s+([^;]+);/m) || [])[1];
-          if (!pkg) throw new Error('MainActivity.java has no package declaration.');
-          const pkgDir = path.join('android/app/src/main/java', ...pkg.split('.'));
-          const helperPath = path.join(pkgDir, 'ApkforgeOAuthDiagnostics.java');
-          fs.mkdirSync(pkgDir, { recursive: true });
-          fs.writeFileSync(helperPath, [
-            'package ' + pkg + ';',
-            '',
-            'import android.app.Activity;',
-            'import android.content.Intent;',
-            'import android.net.Uri;',
-            'import android.util.Log;',
-            '',
-            'public final class ApkforgeOAuthDiagnostics {',
-            '    private static final String TAG = "APKForgeOAuth";',
-            '',
-            '    public static void logActivity(String stage, Activity activity, Intent intent) {',
-            '        try {',
-            '            Log.i(TAG, stage + " taskId=" + activity.getTaskId() + " finishing=" + activity.isFinishing() + " changingConfig=" + activity.isChangingConfigurations() + " intent=" + sanitize(intent));',
-            '        } catch (Throwable t) {',
-            '            Log.e(TAG, "diagnostic logger failed at " + stage, t);',
-            '        }',
-            '    }',
-            '',
-            '    private static String sanitize(Intent intent) {',
-            '        if (intent == null) return "none";',
-            '        Uri data = intent.getData();',
-            '        if (data == null) return "action=" + intent.getAction() + " data=none";',
-            '        StringBuilder keys = new StringBuilder();',
-            '        try {',
-            '            for (String name : data.getQueryParameterNames()) {',
-            '                String lower = name.toLowerCase();',
-            '                if (lower.contains("token") || lower.contains("secret") || lower.contains("password") || lower.contains("refresh") || lower.contains("access")) continue;',
-            '                if (keys.length() > 0) keys.append(",");',
-            '                keys.append(name);',
-            '            }',
-            '        } catch (Throwable ignored) {}',
-            '        return "action=" + intent.getAction() + " scheme=" + data.getScheme() + " host=" + data.getHost() + " path=" + data.getPath() + " queryKeys=" + keys;',
-            '    }',
-            '}',
-            ''
-          ].join('\n'));
+          const pkg = (main.match(/^\s*package\s+([^\s;]+)/m) || [])[1];
+          if (!pkg) throw new Error(mainPath + ' has no package declaration.');
+          // The file already lives in its package directory under either source set
+          // (src/main/java or src/main/kotlin), so derive the helper's directory from
+          // mainPath itself instead of assuming a fixed source root.
+          const pkgDir = path.dirname(mainPath);
+          const helperExt = isKotlin ? '.kt' : '.java';
+          const helperPath = path.join(pkgDir, 'ApkforgeOAuthDiagnostics' + helperExt);
+
           function insertBeforeLastBrace(source, block) {
             const idx = source.lastIndexOf('}');
-            if (idx < 0) throw new Error('MainActivity.java is malformed; missing class closing brace.');
+            if (idx < 0) throw new Error(mainPath + ' is malformed; missing class closing brace.');
             return source.slice(0, idx) + block + '\n' + source.slice(idx);
           }
+
+          // Kotlin uniquely allows a class with no body at all, e.g.
+          // `class MainActivity : BridgeActivity()` with no trailing `{ }`. Java's
+          // grammar has no equivalent (a class always has braces), so this case is
+          // Kotlin-only and must be normalized before any brace-based insertion runs.
+          function ensureKotlinClassBody(source) {
+            const classDeclRe = /(class\s+MainActivity\s*(?:\([^)]*\))?\s*:\s*[^\n{]+?)(\s*\{)?(\r?\n|$)/;
+            const m = classDeclRe.exec(source);
+            if (!m) throw new Error(mainPath + ' does not contain a recognizable "class MainActivity : ..." declaration.');
+            if (m[2]) return source; // already has an opening brace
+            const insertAt = m.index + m[1].length;
+            return source.slice(0, insertAt) + ' {\n}' + source.slice(insertAt);
+          }
+
           function injectIntoMethod(source, regex, line) {
             const match = regex.exec(source);
             if (!match) return null;
-            const open = source.indexOf('{', match.index);
-            if (open < 0) return source;
-            if (source.slice(open, open + 240).includes(line)) return source;
+            // Only insert into a brace-bodied method. An expression-bodied Kotlin
+            // function (`override fun onResume() = super.onResume()`) or an abstract
+            // signature has no `{` immediately following it, and blindly scanning
+            // forward for the next `{` risks landing inside an unrelated method or the
+            // class closing brace and corrupting the file — so that case is refused
+            // rather than guessed at.
+            let i = match.index + match[0].length;
+            while (i < source.length && /\s/.test(source[i])) i++;
+            if (source[i] !== '{') {
+              throw new Error(mainPath + ': found "' + match[0].trim() + '" without a brace-delimited body; refusing to guess where to inject diagnostics (edit the file manually or remove the custom override).');
+            }
+            const open = i;
+            if (source.slice(open, open + 240).includes(line)) return source; // idempotent: already injected
             return source.slice(0, open + 1) + '\n        ' + line + source.slice(open + 1);
           }
-          const needsBundle = /void\s+onCreate\s*\(/.test(main) && !/import\s+android\.os\.Bundle;/.test(main);
-          const needsIntent = /void\s+onNewIntent\s*\(/.test(main) && !/import\s+android\.content\.Intent;/.test(main);
-          if (needsBundle || needsIntent) {
-            main = main.replace(/(package\s+[^;]+;\s*)/, '$1\n' + (needsIntent ? 'import android.content.Intent;\n' : '') + (needsBundle ? 'import android.os.Bundle;\n' : ''));
-          }
+
           if (/ApkforgeOAuthDiagnostics/.test(main)) {
             log('[oauth-diagnostics] MainActivity lifecycle diagnostics already present');
-          } else {
+          } else if (!isKotlin) {
+            // ---------------- Java path (unchanged from prior behavior) ----------------
+            fs.writeFileSync(helperPath, [
+              'package ' + pkg + ';',
+              '',
+              'import android.app.Activity;',
+              'import android.content.Intent;',
+              'import android.net.Uri;',
+              'import android.util.Log;',
+              '',
+              'public final class ApkforgeOAuthDiagnostics {',
+              '    private static final String TAG = "APKForgeOAuth";',
+              '',
+              '    public static void logActivity(String stage, Activity activity, Intent intent) {',
+              '        try {',
+              '            Log.i(TAG, stage + " taskId=" + activity.getTaskId() + " finishing=" + activity.isFinishing() + " changingConfig=" + activity.isChangingConfigurations() + " intent=" + sanitize(intent));',
+              '        } catch (Throwable t) {',
+              '            Log.e(TAG, "diagnostic logger failed at " + stage, t);',
+              '        }',
+              '    }',
+              '',
+              '    private static String sanitize(Intent intent) {',
+              '        if (intent == null) return "none";',
+              '        Uri data = intent.getData();',
+              '        if (data == null) return "action=" + intent.getAction() + " data=none";',
+              '        StringBuilder keys = new StringBuilder();',
+              '        try {',
+              '            for (String name : data.getQueryParameterNames()) {',
+              '                String lower = name.toLowerCase();',
+              '                if (lower.contains("token") || lower.contains("secret") || lower.contains("password") || lower.contains("refresh") || lower.contains("access")) continue;',
+              '                if (keys.length() > 0) keys.append(",");',
+              '                keys.append(name);',
+              '            }',
+              '        } catch (Throwable ignored) {}',
+              '        return "action=" + intent.getAction() + " scheme=" + data.getScheme() + " host=" + data.getHost() + " path=" + data.getPath() + " queryKeys=" + keys;',
+              '    }',
+              '}',
+              ''
+            ].join('\n'));
+
+            const needsBundle = /void\s+onCreate\s*\(/.test(main) && !/import\s+android\.os\.Bundle;/.test(main);
+            const needsIntent = /void\s+onNewIntent\s*\(/.test(main) && !/import\s+android\.content\.Intent;/.test(main);
+            if (needsBundle || needsIntent) {
+              main = main.replace(/(package\s+[^;]+;\s*)/, '$1\n' + (needsIntent ? 'import android.content.Intent;\n' : '') + (needsBundle ? 'import android.os.Bundle;\n' : ''));
+            }
             let patched = injectIntoMethod(main, /(?:public|protected)\s+void\s+onCreate\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());');
             if (patched) main = patched;
             else main = insertBeforeLastBrace(main, '\n    @Override\n    protected void onCreate(android.os.Bundle savedInstanceState) {\n        super.onCreate(savedInstanceState);\n        ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());\n    }\n');
@@ -2171,12 +2635,78 @@ jobs:
             if (patched) main = patched;
             else main = insertBeforeLastBrace(main, '\n    @Override\n    public void onDestroy() {\n        ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());\n        super.onDestroy();\n    }\n');
             fs.writeFileSync(mainPath, main);
-            log('[oauth-diagnostics] Injected Android lifecycle diagnostics into ' + mainPath);
+            log('[oauth-diagnostics] Patched ' + mainPath + ' (Java)');
+          } else {
+            // ---------------- Kotlin path ----------------
+            // A faithful semantic port of the Java helper above: a Kotlin `object` is
+            // the idiomatic equivalent of a Java class of static methods (no
+            // "Companion" indirection or @JvmStatic is needed because every caller
+            // here — MainActivity.kt — is itself Kotlin; @JvmStatic only matters when
+            // *Java* code needs to call a Kotlin object member as a real static
+            // method, which does not apply to this single-language file pair).
+            fs.writeFileSync(helperPath, [
+              'package ' + pkg,
+              '',
+              'import android.app.Activity',
+              'import android.content.Intent',
+              'import android.net.Uri',
+              'import android.util.Log',
+              '',
+              'object ApkforgeOAuthDiagnostics {',
+              '    private const val TAG = "APKForgeOAuth"',
+              '',
+              '    fun logActivity(stage: String, activity: Activity, intent: Intent?) {',
+              '        try {',
+              '            Log.i(TAG, stage + " taskId=" + activity.taskId + " finishing=" + activity.isFinishing + " changingConfig=" + activity.isChangingConfigurations + " intent=" + sanitize(intent))',
+              '        } catch (t: Throwable) {',
+              '            Log.e(TAG, "diagnostic logger failed at " + stage, t)',
+              '        }',
+              '    }',
+              '',
+              '    private fun sanitize(intent: Intent?): String {',
+              '        if (intent == null) return "none"',
+              '        val data: Uri? = intent.data',
+              '        if (data == null) return "action=" + intent.action + " data=none"',
+              '        val keys = StringBuilder()',
+              '        try {',
+              '            for (name in data.queryParameterNames) {',
+              '                val lower = name.lowercase()',
+              '                if (lower.contains("token") || lower.contains("secret") || lower.contains("password") || lower.contains("refresh") || lower.contains("access")) continue',
+              '                if (keys.isNotEmpty()) keys.append(",")',
+              '                keys.append(name)',
+              '            }',
+              '        } catch (ignored: Throwable) {}',
+              '        return "action=" + intent.action + " scheme=" + data.scheme + " host=" + data.host + " path=" + data.path + " queryKeys=" + keys',
+              '    }',
+              '}',
+              ''
+            ].join('\n'));
+
+            main = ensureKotlinClassBody(main);
+            const needsBundle = /fun\s+onCreate\s*\(/.test(main) && !/import\s+android\.os\.Bundle/.test(main);
+            const needsIntent = /fun\s+onNewIntent\s*\(/.test(main) && !/import\s+android\.content\.Intent/.test(main);
+            if (needsBundle || needsIntent) {
+              main = main.replace(/(package\s+[^\s;]+\s*)/, '$1\n' + (needsIntent ? 'import android.content.Intent\n' : '') + (needsBundle ? 'import android.os.Bundle\n' : ''));
+            }
+            let patched = injectIntoMethod(main, /override\s+fun\s+onCreate\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onCreate", this, intent)');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\n    override fun onCreate(savedInstanceState: android.os.Bundle?) {\n        super.onCreate(savedInstanceState)\n        ApkforgeOAuthDiagnostics.logActivity("onCreate", this, intent)\n    }\n');
+            patched = injectIntoMethod(main, /override\s+fun\s+onNewIntent\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent)');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\n    override fun onNewIntent(intent: android.content.Intent) {\n        super.onNewIntent(intent)\n        setIntent(intent)\n        ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent)\n    }\n');
+            patched = injectIntoMethod(main, /override\s+fun\s+onResume\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onResume", this, intent)');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\n    override fun onResume() {\n        super.onResume()\n        ApkforgeOAuthDiagnostics.logActivity("onResume", this, intent)\n    }\n');
+            patched = injectIntoMethod(main, /override\s+fun\s+onDestroy\s*\([^)]*\)/, 'ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, intent)');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\n    override fun onDestroy() {\n        ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, intent)\n        super.onDestroy()\n    }\n');
+            fs.writeFileSync(mainPath, main);
+            log('[oauth-diagnostics] Patched ' + mainPath + ' (Kotlin)');
           }
           log('[oauth-diagnostics] Created sanitized logcat helper at ' + helperPath);
+          log('[oauth-diagnostics] Patch completed successfully');
           NODEEOF
           node /tmp/apkforge-mainactivity-diagnostics.cjs
-
       - name: Decode keystore
         run: |
           set -e
@@ -2500,6 +3030,134 @@ jobs:
 
           BT_DIR="$(ls -d ${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
           AAPT2="$BT_DIR/aapt2"; APKSIGNER="$BT_DIR/apksigner"
+          cat > /tmp/apkforge-manifest-structural-check.cjs <<'CHECKEOF'
+          // Structural AndroidManifest intent-filter verifier.
+          //
+          // Confirms that action VIEW, category DEFAULT, category BROWSABLE and a
+          // matching URI scheme all live inside the SAME <intent-filter> element,
+          // instead of checking whether each string occurs anywhere in the file
+          // independently. Four attributes scattered across four unrelated
+          // intent-filters (e.g. one added by a push-notification plugin, one for
+          // https App Links, one for an unrelated custom scheme) previously satisfied
+          // four separate greps and reported a deep link as present when it was not.
+          //
+          // Works against two input shapes:
+          //   - raw AndroidManifest.xml source (source tree, pre-build)
+          //   - `aapt2 dump xmltree --file AndroidManifest.xml <apk>` output (packaged APK)
+          // so the same logic gates both the pre-build patch and the final artifact.
+          //
+          // Usage: node apkforge-manifest-structural-check.cjs <file> [schemesCsv] [host]
+          const fs = require('fs');
+
+          const file = process.argv[2];
+          const expectedSchemesArg = process.argv[3] || '';
+          const expectedHost = process.argv[4] || '';
+
+          if (!file || !fs.existsSync(file)) {
+            console.error('[manifest-check] FAIL file not found: ' + file);
+            process.exit(1);
+          }
+          const text = fs.readFileSync(file, 'utf8');
+          const expectedSchemes = expectedSchemesArg.split(',').map((s) => s.trim()).filter(Boolean);
+
+          function extractBlocksXml(t) {
+            const blocks = [];
+            const re = /<intent-filter\b[\s\S]*?<\/intent-filter>/g;
+            let m;
+            while ((m = re.exec(t))) blocks.push(m[0]);
+            return blocks;
+          }
+
+          // aapt2's xmltree dump nests children under a line like `E: intent-filter (line=42)`
+          // using two-space indentation per level; the block ends at the first line back at
+          // or above that indentation.
+          function extractBlocksXmltree(t) {
+            const lines = t.split('\n');
+            const blocks = [];
+            let collecting = false;
+            let baseIndent = -1;
+            let current = [];
+            const indentOf = (l) => (l.match(/^\s*/) || [''])[0].length;
+            for (const line of lines) {
+              if (/E: intent-filter\b/.test(line)) {
+                if (collecting) blocks.push(current.join('\n'));
+                collecting = true;
+                baseIndent = indentOf(line);
+                current = [line];
+                continue;
+              }
+              if (collecting) {
+                if (line.trim() === '') { current.push(line); continue; }
+                const ind = indentOf(line);
+                if (ind <= baseIndent) {
+                  blocks.push(current.join('\n'));
+                  collecting = false;
+                  current = [];
+                } else {
+                  current.push(line);
+                }
+              }
+            }
+            if (collecting) blocks.push(current.join('\n'));
+            return blocks;
+          }
+
+          const isXmltree = /E: manifest\b/.test(text) || /E: intent-filter\b/.test(text) || /^N: android=/.test(text);
+          const blocks = isXmltree ? extractBlocksXmltree(text) : extractBlocksXml(text);
+
+          if (!blocks.length) {
+            console.error('[manifest-check] FAIL no <intent-filter> elements found in ' + file);
+            process.exit(1);
+          }
+
+          const has = (block, needle) => block.toLowerCase().includes(needle.toLowerCase());
+
+          let matched = null;
+          let matchedScheme = null;
+          const nearMisses = [];
+          for (const b of blocks) {
+            const hasView = has(b, 'android.intent.action.view');
+            const hasDefault = has(b, 'android.intent.category.default');
+            const hasBrowsable = has(b, 'android.intent.category.browsable');
+            if (!(hasView && hasDefault && hasBrowsable)) {
+              nearMisses.push('view=' + hasView + ' default=' + hasDefault + ' browsable=' + hasBrowsable);
+              continue;
+            }
+            // Match "scheme" and the expected value inside the same line, quoted —
+            // this covers both raw-XML (`android:scheme="duospace"`) and aapt2
+            // xmltree (`android:scheme(0x01010027)="duospace"`) shapes, where an
+            // attribute's resource-id hex blob sits between the name and the value.
+            const valueOnSameLine = (attr, value) => {
+              const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(attr + '[^\\n]*["\']' + escaped + '["\']', 'i');
+              return b.split('\n').some((line) => re.test(line));
+            };
+            const schemeMatch = expectedSchemes.find((s) => valueOnSameLine('scheme', s));
+            const schemeOk = expectedSchemes.length === 0 || !!schemeMatch;
+            const hostOk = !expectedHost || valueOnSameLine('host', expectedHost);
+            if (schemeOk && hostOk) {
+              matched = b;
+              matchedScheme = schemeMatch || '(any)';
+              break;
+            }
+          }
+
+          if (!matched) {
+            console.error(
+              '[manifest-check] FAIL no single <intent-filter> in ' + file +
+              ' contains action VIEW + category DEFAULT + category BROWSABLE' +
+              (expectedSchemes.length ? ' + scheme in [' + expectedSchemes.join(', ') + ']' : '') +
+              (expectedHost ? ' + host=' + expectedHost : '') +
+              ' together (' + blocks.length + ' intent-filter element(s) inspected: ' + nearMisses.join(' | ') + ')'
+            );
+            process.exit(1);
+          }
+          console.log(
+            '[manifest-check] PASS structurally valid VIEW/DEFAULT/BROWSABLE intent-filter found in ' + file +
+            (expectedSchemes.length ? ' (scheme=' + matchedScheme + ')' : '')
+          );
+          process.exit(0);
+          CHECKEOF
 
           if [ -x "$APKSIGNER" ]; then
             "$APKSIGNER" verify --verbose --print-certs "$APK" > /tmp/apk-verify.txt 2>&1 || {
@@ -2551,20 +3209,21 @@ jobs:
             [ "$PKG" = "$BUNDLE_ID" ] || fail "APK package '$PKG' does not match the configured bundle id '$BUNDLE_ID'."
 
             "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > /tmp/xmltree.txt 2>&1 || true
-            grep -q "android.intent.action.VIEW" /tmp/xmltree.txt || fail "The APK contains no deep-link intent filter (VIEW action)."
-            grep -q "android.intent.category.BROWSABLE" /tmp/xmltree.txt || fail "The APK deep-link intent filter is not BROWSABLE, so OAuth callbacks cannot return to the app."
-            log "Deep-link intent filters: present"
 
-            if [ -f android-expected-schemes.txt ]; then
-              while read -r s; do
-                [ -n "$s" ] || continue
-                if grep -qi "\"$s\"" /tmp/xmltree.txt; then
-                  log "Scheme present: $s://"
-                else
-                  fail "Expected URL scheme '$s://' is missing from the built APK."
-                fi
-              done < android-expected-schemes.txt
-            fi
+            # Structural check: VIEW action + DEFAULT + BROWSABLE categories +
+            # a matching scheme must all live inside the SAME <intent-filter>
+            # element in the packaged manifest. Checking each independently
+            # (as before) is exactly the false-positive that let an APK with
+            # no real OAuth callback route through verification: four
+            # unrelated intent-filters (an analytics deep link, a
+            # push-notification scheme, an https App Link, ...) can each
+            # satisfy one substring check without any single one of them
+            # being a working deep link.
+            EXPECTED_SCHEMES=""
+            [ -f android-expected-schemes.txt ] && EXPECTED_SCHEMES="$(paste -sd, android-expected-schemes.txt)"
+            node /tmp/apkforge-manifest-structural-check.cjs /tmp/xmltree.txt "$EXPECTED_SCHEMES" >> "$VERIFY" 2>&1 \
+              || fail "The APK's packaged AndroidManifest.xml has no single intent-filter containing action VIEW + category DEFAULT + category BROWSABLE + a matching URL scheme (${EXPECTED_SCHEMES:-none expected}). See android-apk-verification.txt for which intent-filter(s) were inspected."
+            log "Deep-link intent filter: structurally valid (VIEW + DEFAULT + BROWSABLE + scheme in one <intent-filter>)"
 
             grep -Eqi "BridgeActivity|MainActivity" /tmp/xmltree.txt || fail "No Capacitor bridge activity found in the APK manifest."
             log "Capacitor bridge activity: present"
