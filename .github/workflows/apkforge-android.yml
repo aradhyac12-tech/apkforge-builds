@@ -153,14 +153,35 @@ jobs:
             fi
           fi
           if [ -n "$PM_PREFLIGHT" ]; then
-            if [ "$PM_PREFLIGHT" != "$PM" ]; then
+            if [ -n "$PM_FIELD" ] && [ "$PM_PREFLIGHT" != "$PM" ]; then
+              # package.json declared an explicit packageManager — that is a
+              # stronger, more specific signal than "a lockfile happens to be
+              # present" (stray/leftover lockfiles are common and easy to
+              # miss in review). Do not let preflight's lockfile-driven guess
+              # silently override an explicit declaration; keep the
+              # runner's field-derived choice and say so loudly instead of
+              # quietly switching package managers underneath the user.
+              log "[detect] WARNING: preflight selected \"$PM_PREFLIGHT\" but package.json declares packageManager: $PM_FIELD — honoring the declared packageManager. If $PM_PREFLIGHT is actually intended, remove the packageManager field or the stray lockfile(s) ($LOCKS) to resolve the ambiguity."
+            elif [ "$PM_PREFLIGHT" != "$PM" ]; then
               log "[detect] Preflight selected "$PM_PREFLIGHT" (runner detection said "$PM") — using the preflight decision."
+              PM="$PM_PREFLIGHT"
             fi
-            PM="$PM_PREFLIGHT"
           fi
           case "$PM" in
             bun)
-              command -v bun >/dev/null 2>&1 || curl -fsSL https://bun.sh/install | bash
+              if ! command -v bun >/dev/null 2>&1; then
+                # bun's own installer downloads a release zip from GitHub, which is
+                # the single point of failure reported in the field ("curl: (35)
+                # Recv failure: Connection reset by peer") — one transient reset
+                # otherwise kills the whole build. Retry with backoff before
+                # giving up; the existing command-v check below still fails the
+                # build loudly if every attempt is exhausted.
+                for attempt in 1 2 3; do
+                  if curl -fsSL https://bun.sh/install | bash; then break; fi
+                  log "[detect] Bun install attempt $attempt/3 failed (network error downloading the bun release) — retrying in $((attempt * 5))s"
+                  sleep $((attempt * 5))
+                done
+              fi
               export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"; export PATH="$BUN_INSTALL/bin:$PATH"
               echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
               command -v bun >/dev/null 2>&1 || fail "Project uses Bun but the Bun runtime could not be installed on the runner."
