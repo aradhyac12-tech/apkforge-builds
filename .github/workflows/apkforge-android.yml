@@ -284,7 +284,21 @@ jobs:
           log "[node] Single build Node version: $CUR_NODE (Capacitor CLI requires >= ${REQ_NODE:-unknown})"
 
           CORE_MAJOR="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null || echo "")"
-          if [ -n "$CORE_MAJOR" ]; then
+          ANDROID_MAJOR="$(node -e "try{console.log(require('@capacitor/android/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          if [ -n "$CORE_MAJOR" ] && [ "$ANDROID_MAJOR" = "$CORE_MAJOR" ]; then
+            # @capacitor/android is already present at a compatible major —
+            # skip the otherwise-unconditional install below. A scoped
+            # "npm install <pkg>@<range>" does NOT re-run this project's own
+            # root postinstall hook (only a bare "npm install"/"npm ci"
+            # does), so if that scoped install causes npm to touch/dedupe an
+            # unrelated already-installed package's node_modules folder —
+            # e.g. @capacitor/cli, whose assets a project's postinstall may
+            # have patched during the main install above — the patch is
+            # silently lost with no further log line before "cap add"
+            # reads it. Not installing when nothing needs to change avoids
+            # that class of surprise entirely.
+            log "[capacitor] @capacitor/android@$ANDROID_MAJOR already matches @capacitor/core major $CORE_MAJOR — skipping a redundant install"
+          elif [ -n "$CORE_MAJOR" ]; then
             $ADD_CMD "@capacitor/android@^$CORE_MAJOR" || fail "Could not install @capacitor/android@^$CORE_MAJOR with $PM."
           else
             $ADD_CMD @capacitor/android || fail "Could not install @capacitor/android with $PM."
