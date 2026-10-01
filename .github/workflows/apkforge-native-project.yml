@@ -1,0 +1,380 @@
+name: APKForge Native Project Generator
+run-name: "APKForge Native Project · ${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id: { description: "APKForge build id", required: true }
+      source_url: { description: "Signed URL to source zip", required: true }
+      generation_mode: { description: "auto | generate | normalize", required: true }
+      targets: { description: "Comma-separated subset of android,ios", required: true }
+      app_name: { description: "App display name", required: false, default: "App" }
+      android_application_id: { description: "Reverse-DNS Android applicationId", required: false, default: "" }
+      ios_bundle_id: { description: "Reverse-DNS iOS bundle identifier", required: false, default: "" }
+      version_name: { description: "App version name", required: false, default: "1.0.0" }
+      android_version_code: { description: "Android versionCode", required: false, default: "1" }
+      ios_build_number: { description: "iOS CFBundleVersion", required: false, default: "1" }
+      web_dir: { description: "Web build output directory override", required: false, default: "" }
+      node_version: { description: "Node.js major version for the web build", required: false, default: "22" }
+      finalize_endpoint: { description: "APKForge backend finalization endpoint", required: false, default: "" }
+      diagnostic_token: { description: "APKForge per-build diagnostics token", required: false, default: "" }
+      package_manager: { description: "npm|pnpm|yarn|bun, decided by APKForge preflight", required: false, default: "" }
+      install_command: { description: "Install command decided by APKForge preflight", required: false, default: "" }
+      build_command: { description: "Web build command decided by APKForge preflight", required: false, default: "" }
+
+jobs:
+  android:
+    if: contains(github.event.inputs.targets, 'android')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BUILD_ID: ${{ github.event.inputs.build_id }}
+      APP_NAME: ${{ github.event.inputs.app_name }}
+      APP_ID: ${{ github.event.inputs.android_application_id }}
+      VERSION_NAME: ${{ github.event.inputs.version_name }}
+      VERSION_CODE: ${{ github.event.inputs.android_version_code }}
+      GEN_MODE: ${{ github.event.inputs.generation_mode }}
+    steps:
+      - name: upload
+        run: |
+          set -e
+          curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
+          echo "source archive fetched"
+
+      - name: source_validation
+        run: |
+          set -e
+          # Second security validation, independent of validate-zip.ts's
+          # server-side check — never trust a fetched archive on the strength
+          # of an upstream check alone, in case it ever reaches a runner some
+          # other way. Reject before extraction, not after.
+          MAX_ENTRIES=20000
+          MAX_BYTES=$((2 * 1024 * 1024 * 1024)) # 2 GiB uncompressed
+          LISTING=$(unzip -l source.zip)
+          ENTRY_COUNT=$(echo "$LISTING" | tail -n +4 | head -n -2 | wc -l)
+          echo "archive entries: $ENTRY_COUNT"
+          if [ "$ENTRY_COUNT" -gt "$MAX_ENTRIES" ]; then
+            echo "::error::archive has $ENTRY_COUNT entries, exceeding the $MAX_ENTRIES limit (possible archive bomb)"; exit 1
+          fi
+          TOTAL_BYTES=$(echo "$LISTING" | tail -n +4 | head -n -2 | awk '{sum+=$1} END {print sum+0}')
+          echo "archive uncompressed size: $TOTAL_BYTES bytes"
+          if [ "$TOTAL_BYTES" -gt "$MAX_BYTES" ]; then
+            echo "::error::archive expands to $TOTAL_BYTES bytes, exceeding the $MAX_BYTES limit (possible archive bomb)"; exit 1
+          fi
+          if unzip -l source.zip | awk '{print $4}' | grep -Eq '^(/|[A-Za-z]:\\|\.\./)|(^|/)\.\./' ; then
+            echo "::error::archive contains an absolute path or path-traversal entry"; exit 1
+          fi
+          mkdir -p project
+          unzip -q source.zip -d project
+          # Defense in depth — validate-zip.ts already refused traversal/symlinks
+          # server-side; never trust an archive blindly a second time.
+          find project -type l -print -delete | sed 's/^/[security] removed unexpected symlink: /'
+          if find project -mindepth 1 -maxdepth 1 | wc -l | grep -qx 1; then
+            inner="project/$(ls project)"
+            if [ -d "$inner" ] && [ ! -f project/package.json ]; then
+              mv "$inner"/* project/ 2>/dev/null || true
+              mv "$inner"/.[!.]* project/ 2>/dev/null || true
+              rmdir "$inner" 2>/dev/null || true
+            fi
+          fi
+          test -f project/package.json || { echo "::error::no package.json found in archive"; exit 1; }
+
+      - name: project_detection
+        id: detect
+        run: |
+          set -e
+          cd project
+          HAS_ANDROID=false; HAS_IOS=false; HAS_CAP=false
+          [ -d android ] && [ -f android/gradlew ] && HAS_ANDROID=true
+          { [ -d ios ] && (ls ios/*.xcodeproj >/dev/null 2>&1 || ls ios/*.xcworkspace >/dev/null 2>&1); } && HAS_IOS=true
+          [ -f capacitor.config.json ] || [ -f capacitor.config.ts ] && HAS_CAP=true
+          echo "has_android=$HAS_ANDROID" >> "$GITHUB_OUTPUT"
+          echo "has_ios=$HAS_IOS" >> "$GITHUB_OUTPUT"
+          echo "has_capacitor=$HAS_CAP" >> "$GITHUB_OUTPUT"
+          echo "detected: android=$HAS_ANDROID ios=$HAS_IOS capacitor=$HAS_CAP (mode=$GEN_MODE)"
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with: { node-version: "${{ github.event.inputs.node_version }}" }
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: '21' }
+
+      - name: dependency_install
+        working-directory: project
+        run: |
+          set -e
+          PM="${{ github.event.inputs.package_manager }}"
+          CMD="${{ github.event.inputs.install_command }}"
+          if [ -z "$CMD" ]; then
+            [ -f bun.lock ] && CMD="bun install --frozen-lockfile"
+            [ -f pnpm-lock.yaml ] && CMD="pnpm install --frozen-lockfile"
+            [ -f yarn.lock ] && CMD="yarn install --immutable"
+            [ -z "$CMD" ] && CMD="npm ci --no-audit --no-fund"
+          fi
+          echo "installing with: $CMD"
+          eval "$CMD"
+
+      - name: web_build
+        working-directory: project
+        run: |
+          set -e
+          CMD="${{ github.event.inputs.build_command }}"
+          if [ -n "$CMD" ]; then
+            echo "building with: $CMD"
+            eval "$CMD"
+          else
+            echo "no build command — packaging existing web output as-is"
+          fi
+
+      - name: capacitor_setup
+        working-directory: project
+        run: |
+          set -e
+          WEB_DIR="${{ github.event.inputs.web_dir }}"
+          [ -z "$WEB_DIR" ] && WEB_DIR="dist"
+          if [ "${{ steps.detect.outputs.has_capacitor }}" = "true" ]; then
+            echo "existing valid capacitor.config found — preserving it"
+          else
+            npm install --no-audit --no-fund @capacitor/core @capacitor/cli --no-save
+            npx cap init "$APP_NAME" "$APP_ID" --web-dir "$WEB_DIR"
+          fi
+
+      - name: android_generation
+        working-directory: project
+        run: |
+          set -e
+          npm install --no-audit --no-fund @capacitor/android --no-save
+          if [ "${{ steps.detect.outputs.has_android }}" = "true" ] && [ "$GEN_MODE" != "generate" ]; then
+            echo "existing valid android/ project found — normalizing via sync"
+            npx cap sync android
+          else
+            rm -rf android
+            npx cap add android
+            npx cap sync android
+          fi
+
+      - name: android_validation
+        id: android_validation
+        working-directory: project/android
+        run: |
+          set -e
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+          APK=$(find app/build/outputs/apk/debug -name '*.apk' | head -n1)
+          test -n "$APK" || { echo "::error::no debug APK produced"; exit 1; }
+          SIZE=$(stat -c%s "$APK" 2>/dev/null || stat -f%z "$APK")
+          echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "apk_size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "validated debug APK at $APK ($SIZE bytes)"
+
+      - name: packaging
+        working-directory: project
+        run: |
+          set -e
+          rm -rf node_modules android/app/build android/.gradle android/build
+          zip -qr ../apkforge-native-android.zip android
+          echo "packaged android/ (build artifacts and node_modules excluded)"
+
+      - name: Write validation record
+        if: always()
+        run: |
+          STATUS="failed"
+          [ "${{ steps.android_validation.outcome }}" = "success" ] && STATUS="success"
+          cat > native-validation-android.json <<JSON
+          {
+            "platform": "android",
+            "status": "$STATUS",
+            "apkPath": "${{ steps.android_validation.outputs.apk_path }}",
+            "apkSize": "${{ steps.android_validation.outputs.apk_size }}"
+          }
+          JSON
+
+      - name: Upload android project artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "native-android-${{ github.event.inputs.build_id }}"
+          path: apkforge-native-android.zip
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Upload android validation record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "native-validation-android-${{ github.event.inputs.build_id }}"
+          path: native-validation-android.json
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: finalization
+        if: always()
+        run: |
+          set -e
+          if [ -z "${FINALIZE_ENDPOINT:-}" ]; then exit 0; fi
+          STATUS="failed"
+          [ "${{ job.status }}" = "success" ] && STATUS="success"
+          curl -fsS -X POST "${{ github.event.inputs.finalize_endpoint }}" \
+            -H 'content-type: application/json' \
+            --data-binary @- <<JSON || true
+          { "buildId": "$BUILD_ID", "platform": "android", "status": "$STATUS", "token": "${{ github.event.inputs.diagnostic_token }}" }
+          JSON
+        env:
+          FINALIZE_ENDPOINT: ${{ github.event.inputs.finalize_endpoint }}
+
+  ios:
+    if: contains(github.event.inputs.targets, 'ios')
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      BUILD_ID: ${{ github.event.inputs.build_id }}
+      APP_NAME: ${{ github.event.inputs.app_name }}
+      BUNDLE_ID: ${{ github.event.inputs.ios_bundle_id }}
+      GEN_MODE: ${{ github.event.inputs.generation_mode }}
+    steps:
+      - name: upload
+        run: |
+          set -e
+          curl -sSL --fail -o source.zip "${{ github.event.inputs.source_url }}"
+
+      - name: source_validation
+        run: |
+          set -e
+          mkdir -p project
+          unzip -q source.zip -d project
+          find project -type l -print -delete | sed 's/^/[security] removed unexpected symlink: /'
+          test -f project/package.json || { echo "::error::no package.json found in archive"; exit 1; }
+
+      - name: project_detection
+        id: detect
+        run: |
+          set -e
+          cd project
+          HAS_IOS=false; HAS_CAP=false
+          { ls ios/*.xcodeproj >/dev/null 2>&1 || ls ios/*.xcworkspace >/dev/null 2>&1; } && HAS_IOS=true
+          { [ -f capacitor.config.json ] || [ -f capacitor.config.ts ]; } && HAS_CAP=true
+          echo "has_ios=$HAS_IOS" >> "$GITHUB_OUTPUT"
+          echo "has_capacitor=$HAS_CAP" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with: { node-version: "${{ github.event.inputs.node_version }}" }
+
+      - name: dependency_install
+        working-directory: project
+        run: |
+          set -e
+          CMD="${{ github.event.inputs.install_command }}"
+          [ -z "$CMD" ] && CMD="npm ci --no-audit --no-fund"
+          eval "$CMD"
+
+      - name: web_build
+        working-directory: project
+        run: |
+          set -e
+          CMD="${{ github.event.inputs.build_command }}"
+          [ -n "$CMD" ] && eval "$CMD" || echo "no build command — packaging existing web output as-is"
+
+      - name: capacitor_setup
+        working-directory: project
+        run: |
+          set -e
+          WEB_DIR="${{ github.event.inputs.web_dir }}"
+          [ -z "$WEB_DIR" ] && WEB_DIR="dist"
+          if [ "${{ steps.detect.outputs.has_capacitor }}" != "true" ]; then
+            npm install --no-audit --no-fund @capacitor/core @capacitor/cli --no-save
+            npx cap init "$APP_NAME" "$BUNDLE_ID" --web-dir "$WEB_DIR"
+          fi
+
+      - name: ios_generation
+        working-directory: project
+        run: |
+          set -e
+          npm install --no-audit --no-fund @capacitor/ios --no-save
+          if [ "${{ steps.detect.outputs.has_ios }}" = "true" ] && [ "$GEN_MODE" != "generate" ]; then
+            npx cap sync ios
+          else
+            rm -rf ios
+            npx cap add ios
+            npx cap sync ios
+          fi
+
+      - name: ios_validation
+        id: ios_validation
+        working-directory: project/ios/App
+        run: |
+          set -e
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          [ -f Podfile ] && command -v pod >/dev/null 2>&1 && pod install --repo-update || true
+          WORKSPACE=$(ls *.xcworkspace 2>/dev/null | head -n1)
+          PROJECT=$(ls *.xcodeproj 2>/dev/null | head -n1)
+          test -n "$WORKSPACE" || test -n "$PROJECT" || { echo "::error::no .xcworkspace or .xcodeproj found"; exit 1; }
+          SCHEME=$(xcodebuild -list -json $([ -n "$WORKSPACE" ] && echo "-workspace $WORKSPACE" || echo "-project $PROJECT") \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log((j.project?.schemes||j.workspace?.schemes||[])[0]||'App')})")
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          xcodebuild build \
+            $([ -n "$WORKSPACE" ] && echo "-workspace $WORKSPACE" || echo "-project $PROJECT") \
+            -scheme "$SCHEME" \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "*.app" -path "*iphonesimulator*" | head -n1)
+          test -n "$APP_PATH" || { echo "::error::no simulator .app produced"; exit 1; }
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "validated unsigned simulator build at $APP_PATH — NOT a signed, installable IPA"
+
+      - name: packaging
+        working-directory: project
+        run: |
+          set -e
+          rm -rf node_modules ios/App/Pods ios/App/build
+          zip -qr ../apkforge-native-ios.zip ios
+          echo "packaged ios/ (Pods and build products excluded)"
+
+      - name: Write validation record
+        if: always()
+        run: |
+          STATUS="failed"
+          [ "${{ steps.ios_validation.outcome }}" = "success" ] && STATUS="success"
+          cat > native-validation-ios.json <<JSON
+          {
+            "platform": "ios",
+            "status": "$STATUS",
+            "scheme": "${{ steps.ios_validation.outputs.scheme }}",
+            "appPath": "${{ steps.ios_validation.outputs.app_path }}"
+          }
+          JSON
+
+      - name: Upload ios project artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "native-ios-${{ github.event.inputs.build_id }}"
+          path: apkforge-native-ios.zip
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Upload ios validation record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "native-validation-ios-${{ github.event.inputs.build_id }}"
+          path: native-validation-ios.json
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: finalization
+        if: always()
+        run: |
+          set -e
+          if [ -z "${FINALIZE_ENDPOINT:-}" ]; then exit 0; fi
+          STATUS="failed"
+          [ "${{ job.status }}" = "success" ] && STATUS="success"
+          curl -fsS -X POST "${{ github.event.inputs.finalize_endpoint }}" \
+            -H 'content-type: application/json' \
+            --data-binary @- <<JSON || true
+          { "buildId": "$BUILD_ID", "platform": "ios", "status": "$STATUS", "token": "${{ github.event.inputs.diagnostic_token }}" }
+          JSON
+        env:
+          FINALIZE_ENDPOINT: ${{ github.event.inputs.finalize_endpoint }}
