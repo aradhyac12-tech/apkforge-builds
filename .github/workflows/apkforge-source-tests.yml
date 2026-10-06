@@ -1,0 +1,86 @@
+name: APKForge Source Tests
+run-name: "APKForge Tests - ${{ inputs.run_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      run_id: { description: "APKForge test run id", required: true }
+      source_url: { description: "Signed URL to source zip", required: true }
+      commands_b64: { description: "Base64 JSON command list", required: true }
+      callback_url: { description: "Result callback endpoint", required: true }
+      run_token: { description: "Per-run callback token", required: true }
+      node_version: { description: "Node.js major version", required: false, default: "22" }
+      package_manager: { description: "npm|pnpm|yarn|bun", required: false, default: "npm" }
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+      - name: package managers
+        if: inputs.package_manager == 'pnpm' || inputs.package_manager == 'yarn'
+        run: corepack enable
+      - uses: oven-sh/setup-bun@v2
+        if: inputs.package_manager == 'bun'
+      - name: run tests
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          COMMANDS_B64: ${{ inputs.commands_b64 }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          RUN_TOKEN: ${{ inputs.run_token }}
+        run: |
+          cat > /tmp/runner.py <<'PY'
+
+          import base64, io, json, os, subprocess, time, urllib.request, zipfile
+          cmds = json.loads(base64.b64decode(os.environ["COMMANDS_B64"]).decode())
+          results = []
+          def post(payload):
+              req = urllib.request.Request(os.environ["CALLBACK_URL"], data=json.dumps(payload).encode(), headers={"content-type": "application/json"}, method="POST")
+              for i in range(3):
+                  try:
+                      urllib.request.urlopen(req, timeout=30).read(); return
+                  except Exception as e:
+                      print("callback failed:", e); time.sleep(5)
+          def ver(c):
+              try:
+                  return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=60).stdout.strip().splitlines()[0][:120]
+              except Exception:
+                  return None
+          try:
+              data = urllib.request.urlopen(os.environ["SOURCE_URL"], timeout=300).read()
+              zipfile.ZipFile(io.BytesIO(data)).extractall("src")
+          except Exception as e:
+              post({"runId": os.environ["RUN_ID"], "token": os.environ["RUN_TOKEN"], "fatal": "Could not download or unzip the source: " + str(e)[:300], "results": []})
+              raise SystemExit(1)
+          root = "src"
+          entries = [e for e in os.listdir("src") if e != "__MACOSX"]
+          if len(entries) == 1 and os.path.isdir(os.path.join("src", entries[0])):
+              root = os.path.join("src", entries[0])
+          status = {}
+          for c in cmds:
+              bad = [r for r in c.get("requires", []) if status.get(r) not in (None, "PASSED")]
+              if bad:
+                  status[c["key"]] = "BLOCKED"
+                  results.append({"key": c["key"], "status": "BLOCKED", "exitCode": None, "durationMs": 0, "log": "Not run: prerequisite " + ", ".join(bad) + " did not pass."})
+                  continue
+              t = time.time()
+              try:
+                  p = subprocess.run(["bash", "-o", "pipefail", "-c", c["command"]], cwd=root, capture_output=True, text=True, timeout=c.get("timeoutSec", 900), env={**os.environ, "CI": "true", "FORCE_COLOR": "0"})
+                  code, out = p.returncode, (p.stdout or "") + (p.stderr or "")
+              except subprocess.TimeoutExpired:
+                  code, out = 124, "Timed out after " + str(c.get("timeoutSec", 900)) + "s."
+              st = "PASSED" if code == 0 else "FAILED"
+              status[c["key"]] = st
+              print("::group::" + c["key"] + " -> " + st + " (exit " + str(code) + ")"); print(out[-20000:]); print("::endgroup::")
+              results.append({"key": c["key"], "status": st, "exitCode": code, "durationMs": int((time.time() - t) * 1000), "log": out[-6000:]})
+          post({
+              "runId": os.environ["RUN_ID"], "token": os.environ["RUN_TOKEN"], "results": results,
+              "toolchain": {"node": ver("node --version"), "npm": ver("npm --version"), "pnpm": ver("pnpm --version"), "yarn": ver("yarn --version"), "bun": ver("bun --version"), "os": ver("lsb_release -ds"), "runner": "github-actions ubuntu-latest"},
+              "githubRunId": os.environ.get("GITHUB_RUN_ID"),
+          })
+
+          PY
+          python3 /tmp/runner.py
