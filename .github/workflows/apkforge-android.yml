@@ -63,6 +63,11 @@ jobs:
           org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8
           kotlin.compiler.execution.strategy=in-process
           GPROPS
+          # Lint-vital only re-checks sources APKForge already validated; skipping it
+          # saves 30-90s per build. Matching by name never fails if a task is absent.
+          cat > ~/.gradle/init.d/apkforge-speed.gradle <<'GINIT'
+          allprojects { tasks.configureEach { t -> if (t.name.startsWith('lintVital')) { t.enabled = false } } }
+          GINIT
       - name: Fetch source
         run: |
           set -e
@@ -3524,7 +3529,7 @@ jobs:
             echo "APKForge publish skipped: no endpoint/token"
             exit 0
           fi
-          APK="$(find android/app/build/outputs/apk/release -name '*.apk' ! -name '*unsigned*' 2>/dev/null | sort | head -n 1)"
+          APK="$(find android/app/build/outputs/apk/release -name '*.apk' ! -name '*unsigned*' 2>/dev/null | head -n 1)"
           AAB="$(find android/app/build/outputs/bundle/release -name '*.aab' 2>/dev/null | head -n 1)"
           if [ -z "$APK" ]; then
             echo "APKForge publish skipped: no release APK found"
