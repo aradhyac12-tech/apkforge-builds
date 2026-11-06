@@ -34,50 +34,94 @@ jobs:
         run: |
           cat > /tmp/runner.py <<'PY'
 
-          import base64, io, json, os, subprocess, time, urllib.request, zipfile
+          import base64, collections, io, json, os, subprocess, threading, time, urllib.request, zipfile
           cmds = json.loads(base64.b64decode(os.environ["COMMANDS_B64"]).decode())
           results = []
-          def post(payload):
+          sent = 0
+          def post(payload, tries=3):
               req = urllib.request.Request(os.environ["CALLBACK_URL"], data=json.dumps(payload).encode(), headers={"content-type": "application/json"}, method="POST")
-              for i in range(3):
+              for i in range(tries):
                   try:
                       urllib.request.urlopen(req, timeout=30).read(); return
                   except Exception as e:
-                      print("callback failed:", e); time.sleep(5)
+                      print("callback failed:", e)
+                      if i < tries - 1: time.sleep(3)
+              raise RuntimeError("Could not deliver test progress after " + str(tries) + " attempts; stopping instead of running invisible tests.")
+          def base(**kw):
+              d = {"runId": os.environ["RUN_ID"], "token": os.environ["RUN_TOKEN"], "complete": False, "githubRunId": os.environ.get("GITHUB_RUN_ID")}
+              d.update(kw); return d
+          def progress(active=None):
+              # Only send results the app has not seen yet (keeps every post small).
+              global sent
+              batch = results[sent:]
+              post(base(activeKey=active, results=batch))
+              sent = len(results)
           def ver(c):
               try:
                   return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=60).stdout.strip().splitlines()[0][:120]
               except Exception:
                   return None
+          def run_one(c, root):
+              """Run one command, streaming its output. A heartbeat tells the app every few seconds that this test is alive and what it last printed."""
+              tail = collections.deque(maxlen=400)
+              done = threading.Event()
+              def beat():
+                  while not done.wait(8):
+                      try:
+                          post(base(activeKey=c["key"], activeLog="\n".join(list(tail)[-12:])[-900:], results=[]), tries=1)
+                      except Exception:
+                          pass
+              t = threading.Thread(target=beat, daemon=True); t.start()
+              timeout = c.get("timeoutSec", 900)
+              try:
+                  p = subprocess.Popen(["bash", "-o", "pipefail", "-c", c["command"]], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1, env={**os.environ, "CI": "true", "FORCE_COLOR": "0"})
+                  timed_out = [False]
+                  def kill():
+                      timed_out[0] = True
+                      try: p.kill()
+                      except Exception: pass
+                  timer = threading.Timer(timeout, kill); timer.start()
+                  for line in p.stdout:
+                      tail.append(line.rstrip("\n"))
+                  p.wait(); timer.cancel()
+                  code = 124 if timed_out[0] else p.returncode
+                  out = "\n".join(tail)
+                  if timed_out[0]: out += "\nTimed out after " + str(timeout) + "s."
+              finally:
+                  done.set()
+              return code, out
           try:
               data = urllib.request.urlopen(os.environ["SOURCE_URL"], timeout=300).read()
               zipfile.ZipFile(io.BytesIO(data)).extractall("src")
           except Exception as e:
-              post({"runId": os.environ["RUN_ID"], "token": os.environ["RUN_TOKEN"], "fatal": "Could not download or unzip the source: " + str(e)[:300], "results": []})
+              post(base(complete=True, fatal="Could not download or unzip the source: " + str(e)[:300], results=[]))
               raise SystemExit(1)
           root = "src"
           entries = [e for e in os.listdir("src") if e != "__MACOSX"]
           if len(entries) == 1 and os.path.isdir(os.path.join("src", entries[0])):
               root = os.path.join("src", entries[0])
+          # Tell the app the builder is up before the first (slow) command starts.
+          try: post(base(activeKey=None, results=[], started=True), tries=2)
+          except Exception: pass
           status = {}
           for c in cmds:
               bad = [r for r in c.get("requires", []) if status.get(r) not in (None, "PASSED")]
               if bad:
                   status[c["key"]] = "BLOCKED"
                   results.append({"key": c["key"], "status": "BLOCKED", "exitCode": None, "durationMs": 0, "log": "Not run: prerequisite " + ", ".join(bad) + " did not pass."})
+                  progress()
                   continue
-              t = time.time()
-              try:
-                  p = subprocess.run(["bash", "-o", "pipefail", "-c", c["command"]], cwd=root, capture_output=True, text=True, timeout=c.get("timeoutSec", 900), env={**os.environ, "CI": "true", "FORCE_COLOR": "0"})
-                  code, out = p.returncode, (p.stdout or "") + (p.stderr or "")
-              except subprocess.TimeoutExpired:
-                  code, out = 124, "Timed out after " + str(c.get("timeoutSec", 900)) + "s."
+              progress(c["key"])
+              t0 = time.time()
+              code, out = run_one(c, root)
               st = "PASSED" if code == 0 else "FAILED"
               status[c["key"]] = st
               print("::group::" + c["key"] + " -> " + st + " (exit " + str(code) + ")"); print(out[-20000:]); print("::endgroup::")
-              results.append({"key": c["key"], "status": st, "exitCode": code, "durationMs": int((time.time() - t) * 1000), "log": out[-6000:]})
+              results.append({"key": c["key"], "status": st, "exitCode": code, "durationMs": int((time.time() - t0) * 1000), "log": out[-6000:]})
+              progress()
           post({
-              "runId": os.environ["RUN_ID"], "token": os.environ["RUN_TOKEN"], "results": results,
+              "runId": os.environ["RUN_ID"], "token": os.environ["RUN_TOKEN"], "complete": True, "results": [],
+              "allKeys": [r["key"] for r in results],
               "toolchain": {"node": ver("node --version"), "npm": ver("npm --version"), "pnpm": ver("pnpm --version"), "yarn": ver("yarn --version"), "bun": ver("bun --version"), "os": ver("lsb_release -ds"), "runner": "github-actions ubuntu-latest"},
               "githubRunId": os.environ.get("GITHUB_RUN_ID"),
           })
